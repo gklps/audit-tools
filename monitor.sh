@@ -14,7 +14,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Configuration
-INSTALL_DIR="/datadrive/Rubix"
+INSTALL_DIR="$(pwd)"
 REFRESH_INTERVAL=10
 
 # Function to print colored output

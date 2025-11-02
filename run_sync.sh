@@ -12,7 +12,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-INSTALL_DIR="/datadrive/Rubix"
+INSTALL_DIR="$(pwd)"
 LOG_FILE="sync_run.log"
 
 # Function to print colored output

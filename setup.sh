@@ -12,7 +12,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-INSTALL_DIR="/datadrive/Rubix"
+INSTALL_DIR="$(pwd)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="setup.log"
 
@@ -83,18 +83,85 @@ install_system_deps() {
     # Install Microsoft ODBC Driver for SQL Server
     print_status "Installing Microsoft ODBC Driver for SQL Server..."
 
-    # Download and install Microsoft keys
-    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+    # Remove any existing problematic repository entries
+    sudo rm -f /etc/apt/sources.list.d/mssql-release.list
 
-    # Add Microsoft repository
+    # Detect Ubuntu version and use appropriate repository
     UBUNTU_VERSION=$(lsb_release -rs)
-    echo "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/${UBUNTU_VERSION}/prod ${UBUNTU_VERSION} main" | sudo tee /etc/apt/sources.list.d/mssql-release.list
+    UBUNTU_CODENAME=$(lsb_release -cs)
 
-    # Update and install ODBC driver
-    sudo apt update
-    sudo ACCEPT_EULA=Y apt install -y msodbcsql17
+    print_status "Detected Ubuntu $UBUNTU_VERSION ($UBUNTU_CODENAME)"
 
-    print_success "System dependencies installed."
+    # Use different approach based on Ubuntu version
+    if [[ "$UBUNTU_VERSION" == "22.04" ]] || [[ "$UBUNTU_CODENAME" == "jammy" ]]; then
+        # Ubuntu 22.04 - use the official method
+        print_status "Setting up for Ubuntu 22.04..."
+        curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+        echo "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" | sudo tee /etc/apt/sources.list.d/mssql-release.list
+    elif [[ "$UBUNTU_VERSION" == "20.04" ]] || [[ "$UBUNTU_CODENAME" == "focal" ]]; then
+        # Ubuntu 20.04 - use the official method
+        print_status "Setting up for Ubuntu 20.04..."
+        curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+        echo "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/20.04/prod focal main" | sudo tee /etc/apt/sources.list.d/mssql-release.list
+    elif [[ "$UBUNTU_VERSION" == "18.04" ]] || [[ "$UBUNTU_CODENAME" == "bionic" ]]; then
+        # Ubuntu 18.04
+        print_status "Setting up for Ubuntu 18.04..."
+        curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+        echo "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/18.04/prod bionic main" | sudo tee /etc/apt/sources.list.d/mssql-release.list
+    else
+        # Fallback for other versions - try Ubuntu 20.04 repository
+        print_warning "Unsupported Ubuntu version. Trying Ubuntu 20.04 repository as fallback..."
+        curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+        echo "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/20.04/prod focal main" | sudo tee /etc/apt/sources.list.d/mssql-release.list
+    fi
+
+    # Update package list and install ODBC driver
+    print_status "Updating package list..."
+    if sudo apt update; then
+        print_status "Installing ODBC driver..."
+        if sudo ACCEPT_EULA=Y apt install -y msodbcsql17; then
+            print_success "Microsoft ODBC Driver installed successfully."
+        else
+            print_warning "Failed to install msodbcsql17. Trying alternative installation..."
+            # Try installing with msodbcsql18 as fallback
+            if sudo ACCEPT_EULA=Y apt install -y msodbcsql18; then
+                print_success "Microsoft ODBC Driver 18 installed successfully."
+            else
+                print_error "Failed to install Microsoft ODBC Driver. You may need to install it manually."
+                print_status "Alternative: Install unixodbc and use FreeTDS driver as fallback"
+                sudo apt install -y unixodbc freetds-dev freetds-bin tdsodbc
+                print_warning "Installed FreeTDS as ODBC fallback. You may need to configure connection strings differently."
+            fi
+        fi
+    else
+        print_error "Failed to update package list. Repository may be temporarily unavailable."
+        print_status "Installing fallback ODBC drivers..."
+        sudo apt install -y unixodbc freetds-dev freetds-bin tdsodbc
+        print_warning "Installed FreeTDS as ODBC fallback. You may need to configure connection strings differently."
+    fi
+
+    # Verify ODBC installation
+    print_status "Verifying ODBC installation..."
+    if command -v sqlcmd &> /dev/null || [ -f "/opt/microsoft/msodbcsql17/lib64/libmsodbcsql-17.so" ] || [ -f "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.so" ]; then
+        print_success "ODBC driver verification passed."
+    else
+        print_warning "ODBC driver verification failed. You may need to install it manually."
+        echo ""
+        echo "Manual installation commands:"
+        echo "# Remove existing repository"
+        echo "sudo rm -f /etc/apt/sources.list.d/mssql-release.list"
+        echo ""
+        echo "# Add Microsoft repository (adjust for your Ubuntu version)"
+        echo "curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg"
+        echo "echo \"deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/20.04/prod focal main\" | sudo tee /etc/apt/sources.list.d/mssql-release.list"
+        echo ""
+        echo "# Install ODBC driver"
+        echo "sudo apt update"
+        echo "sudo ACCEPT_EULA=Y apt install -y msodbcsql17"
+        echo ""
+    fi
+
+    print_success "System dependencies installation completed."
 }
 
 # Function to create installation directory
@@ -106,8 +173,6 @@ create_install_dir() {
 
     # Create subdirectories
     mkdir -p "$INSTALL_DIR/logs"
-    mkdir -p "$INSTALL_DIR/config"
-    mkdir -p "$INSTALL_DIR/scripts"
 
     print_success "Installation directory created."
 }
@@ -130,23 +195,21 @@ copy_files() {
     cp "$SCRIPT_DIR/AZURE_SQL_MIGRATION_GUIDE.md" "$INSTALL_DIR/"
     cp "$SCRIPT_DIR/DETAILED_LOGGING_GUIDE.md" "$INSTALL_DIR/"
 
-    # Copy utility scripts
-    cp "$SCRIPT_DIR/run_sync.sh" "$INSTALL_DIR/scripts/" 2>/dev/null || create_run_script
-    cp "$SCRIPT_DIR/monitor.sh" "$INSTALL_DIR/scripts/" 2>/dev/null || create_monitor_script
-
-    # Make scripts executable
-    chmod +x "$INSTALL_DIR/scripts/"*.sh
+    # Make scripts executable (they're already in the cloned directory)
+    chmod +x "$INSTALL_DIR/run_sync.sh" 2>/dev/null || true
+    chmod +x "$INSTALL_DIR/monitor.sh" 2>/dev/null || true
+    chmod +x "$INSTALL_DIR/setup.sh" 2>/dev/null || true
 
     print_success "Application files copied."
 }
 
 # Function to create run script if it doesn't exist
 create_run_script() {
-    cat > "$INSTALL_DIR/scripts/run_sync.sh" << 'EOF'
+    cat > "$INSTALL_DIR/run_sync.sh" << 'EOF'
 #!/bin/bash
 # Run Rubix Token Sync
 
-cd /datadrive/Rubix
+# Work from current directory
 
 echo "🚀 Starting Rubix Token Sync..."
 echo "📁 Working directory: $(pwd)"
@@ -169,11 +232,11 @@ EOF
 
 # Function to create monitor script if it doesn't exist
 create_monitor_script() {
-    cat > "$INSTALL_DIR/scripts/monitor.sh" << 'EOF'
+    cat > "$INSTALL_DIR/monitor.sh" << 'EOF'
 #!/bin/bash
 # Monitor Rubix Token Sync
 
-cd /datadrive/Rubix
+# Work from current directory
 
 echo "📊 Rubix Token Sync Monitor"
 echo "================================"
@@ -461,11 +524,22 @@ main() {
                 shift
                 ;;
             --help)
+                echo "Rubix Token Sync - Setup Script"
+                echo ""
                 echo "Usage: $0 [options]"
+                echo ""
                 echo "Options:"
                 echo "  --venv      Create and use Python virtual environment"
-                echo "  --skip-deps Skip system dependency installation"
+                echo "  --skip-deps Skip system dependency installation (useful if ODBC fails)"
                 echo "  --help      Show this help message"
+                echo ""
+                echo "If Microsoft ODBC driver installation fails:"
+                echo "  1. Run with --skip-deps: ./setup.sh --skip-deps"
+                echo "  2. Install ODBC manually:"
+                echo "     sudo apt install -y unixodbc freetds-dev freetds-bin tdsodbc"
+                echo "  3. Continue with Python setup"
+                echo ""
+                echo "The script will automatically handle repository issues and provide fallback options."
                 exit 0
                 ;;
             *)

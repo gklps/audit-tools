@@ -43,8 +43,8 @@ chmod +x setup.sh
 
 ### **Step 3: Start Sync**
 ```bash
-cd /datadrive/Rubix
-./scripts/run_sync.sh
+# Stay in the cloned repository directory
+./run_sync.sh
 ```
 
 ## 🎯 **What the Setup Script Does**
@@ -56,7 +56,7 @@ cd /datadrive/Rubix
 - Sets up proper permissions
 
 ### ✅ **Application Deployment**
-- Copies all application files to `/datadrive/Rubix`
+- Sets up application in the current cloned directory
 - Installs Python dependencies
 - Creates utility scripts and monitoring tools
 - Sets up log rotation and directory structure
@@ -131,15 +131,15 @@ All VMs will report to the same Telegram group with machine identification:
 
 ### **Running Sync**
 ```bash
-./scripts/run_sync.sh                # Interactive run with testing
-./scripts/run_sync.sh --test-only    # Test connections only
-./scripts/run_sync.sh --background   # Run in background
+./run_sync.sh                # Interactive run with testing
+./run_sync.sh --test-only    # Test connections only
+./run_sync.sh --background   # Run in background
 ```
 
 ### **Monitoring**
 ```bash
-./scripts/monitor.sh              # System status snapshot
-./scripts/monitor.sh --interactive # Live monitoring dashboard
+./monitor.sh              # System status snapshot
+./monitor.sh --interactive # Live monitoring dashboard
 python3 log_analyzer.py --hours 24   # Performance analysis
 ```
 
@@ -221,9 +221,9 @@ sudo journalctl -u rubix-sync -f     # View service logs
 
 ### **Documentation Access**
 All documentation is included in the package:
-- `/datadrive/Rubix/README.md` - Complete usage guide
-- `/datadrive/Rubix/AZURE_SQL_MIGRATION_GUIDE.md` - Technical details
-- `/datadrive/Rubix/DETAILED_LOGGING_GUIDE.md` - Monitoring guide
+- `README.md` - Complete usage guide
+- `AZURE_SQL_MIGRATION_GUIDE.md` - Technical details
+- `DETAILED_LOGGING_GUIDE.md` - Monitoring guide
 
 ## 🎉 **Deployment Checklist**
 
@@ -235,12 +235,12 @@ All documentation is included in the package:
 
 ### **Deployment**
 - [ ] Run `./setup.sh` and complete configuration wizard
-- [ ] Test connections with `./scripts/run_sync.sh --test-only`
+- [ ] Test connections with `./run_sync.sh --test-only`
 - [ ] Verify Telegram notifications in group chat
 - [ ] Configure systemd service (optional)
 
 ### **Post-deployment**
-- [ ] Monitor first sync run with `./scripts/monitor.sh --interactive`
+- [ ] Monitor first sync run with `./monitor.sh --interactive`
 - [ ] Verify Azure SQL Database table creation and data insertion
 - [ ] Check Telegram group for real-time notifications
 - [ ] Set up log monitoring and alerting as needed

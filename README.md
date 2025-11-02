@@ -26,26 +26,25 @@ cd rubix-token-sync
 chmod +x setup.sh
 ./setup.sh
 
-# 3. Run the sync
-cd /datadrive/Rubix
-./scripts/run_sync.sh
+# 3. Run the sync (stay in cloned directory)
+./run_sync.sh
 ```
 
 ### Option 2: Manual Setup
 
 ```bash
-# 1. Copy files to your VM
-scp -r * user@your-vm:/datadrive/Rubix/
+# 1. Clone repository to your VM
+git clone <repository-url>
+cd rubix-token-sync
 
 # 2. Install dependencies
-cd /datadrive/Rubix
 sudo apt update
 sudo apt install python3-pip -y
 pip3 install -r requirements.txt
 
 # 3. Configure (edit with your credentials)
-cp config/azure_sql_connection_template.txt azure_sql_connection.txt
-cp config/telegram_config_template.json telegram_config.json
+cp azure_sql_connection_template.txt azure_sql_connection.txt
+cp telegram_config_template.json telegram_config.json
 
 # 4. Run
 python3 sync_distributed_tokens.py
@@ -177,9 +176,9 @@ All VMs report to the same Telegram group:
 
 **Usage:**
 ```bash
-./scripts/run_sync.sh                # Interactive run
-./scripts/run_sync.sh --test-only    # Test connections only
-./scripts/run_sync.sh --background   # Run in background
+./run_sync.sh                # Interactive run
+./run_sync.sh --test-only    # Test connections only
+./run_sync.sh --background   # Run in background
 ```
 
 ### `monitor.sh` - Real-time Dashboard
@@ -192,8 +191,8 @@ All VMs report to the same Telegram group:
 
 **Usage:**
 ```bash
-./scripts/monitor.sh              # Single shot view
-./scripts/monitor.sh --interactive # Live dashboard
+./monitor.sh              # Single shot view
+./monitor.sh --interactive # Live dashboard
 ```
 
 ## 📋 System Requirements
@@ -286,7 +285,7 @@ print('✅ Telegram connection successful!' if notifier.test_connection() else '
 #### Performance Issues
 ```bash
 # Check system resources
-./scripts/monitor.sh
+./monitor.sh
 
 # Analyze performance patterns
 python3 log_analyzer.py --hours 6
@@ -310,10 +309,10 @@ sudo systemctl restart rubix-sync
 ## 🔄 Upgrade Path
 
 ### From Previous Version
-1. **Backup**: `cp -r /datadrive/Rubix /datadrive/Rubix.backup`
+1. **Backup**: `cp -r $(pwd) $(pwd).backup`
 2. **Deploy**: Copy new files to installation directory
 3. **Configure**: Update configuration files with new options
-4. **Test**: Run `./scripts/run_sync.sh --test-only`
+4. **Test**: Run `./run_sync.sh --test-only`
 5. **Deploy**: Start enhanced sync
 
 ### Configuration Migration
@@ -331,7 +330,7 @@ sudo systemctl restart rubix-sync
 ### Monitoring Channels
 - **Telegram Group**: Real-time notifications and multi-VM coordination
 - **Log Files**: Comprehensive audit trail with structured logging
-- **Monitor Dashboard**: `./scripts/monitor.sh --interactive`
+- **Monitor Dashboard**: `./monitor.sh --interactive`
 
 ### Performance Optimization
 - **Increase Workers**: For faster IPFS nodes, increase `NUM_IPFS_WORKERS`

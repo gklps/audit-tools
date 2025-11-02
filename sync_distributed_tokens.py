@@ -38,9 +38,20 @@ except ImportError:
 
 # Configuration
 AZURE_SQL_CONNECTION_STRING = "Server=tcp:rauditser.database.windows.net,1433;Initial Catalog=rauditd;Persist Security Info=False;User ID=rubix;Password={your_password};MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
-CONNECTION_CONFIG_FILE = '/datadrive/Rubix/azure_sql_connection.txt'
-IPFS_COMMAND = './ipfs'
-TELEGRAM_CONFIG_FILE = '/datadrive/Rubix/telegram_config.json'
+CONNECTION_CONFIG_FILE = 'azure_sql_connection.txt'
+# Try different IPFS paths - adjust based on your installation
+IPFS_COMMAND = None
+for ipfs_path in ['./ipfs', '../Node/creator/ipfs', '/usr/local/bin/ipfs', 'ipfs']:
+    try:
+        result = subprocess.run([ipfs_path, 'version'], capture_output=True, timeout=5)
+        if result.returncode == 0:
+            IPFS_COMMAND = ipfs_path
+            break
+    except:
+        continue
+if not IPFS_COMMAND:
+    IPFS_COMMAND = 'ipfs'  # Fallback to system PATH
+TELEGRAM_CONFIG_FILE = 'telegram_config.json'
 
 # Performance tuning - Optimized for Azure SQL Database
 NUM_DB_WORKERS = max(1, cpu_count() // 2)  # Parallel database processing
@@ -1654,7 +1665,9 @@ def main():
 
             # Find all rubix.db files
             with OperationContext("FIND_DATABASES", 'MAIN', logger):
-                databases = find_rubix_databases()
+                # Search from parent directory when running from cloned repo
+                search_path = os.path.join('..', 'Node') if os.path.exists('../Node') else '..'
+                databases = find_rubix_databases(search_path)
                 sync_metrics.total_databases_found = len(databases)
 
                 audit_logger.log_with_context(
