@@ -1241,6 +1241,251 @@ def process_token_ipfs(args: Tuple) -> TokenRecord:
     return record
 
 
+def ensure_essential_metadata(db_path: str, source_ip: str, force_update: bool = False) -> bool:
+    """
+    Ensure essential metadata (token_id, did, source_ip, node_name) is captured
+    in the database even if IPFS or other processing fails.
+
+    This function guarantees we have core node data coverage by inserting minimal
+    records with just the essential fields.
+
+    Args:
+        db_path: Path to the SQLite database
+        source_ip: Source IP address
+        force_update: If True, update existing records with minimal data
+
+    Returns:
+        bool: True if essential metadata was successfully captured
+    """
+    try:
+        node_name = extract_node_name(db_path)
+        logger.info(f"Ensuring essential metadata for {node_name}: {db_path}")
+
+        # Connect to SQLite database
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Check if TokensTable exists
+        cursor.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='TokensTable'
+        """)
+
+        if not cursor.fetchone():
+            logger.warning(f"TokensTable not found in {db_path}")
+            conn.close()
+            return False
+
+        # Check which essential columns exist
+        cursor.execute("PRAGMA table_info(TokensTable)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        # Build query for essential fields only
+        essential_selects = []
+        if 'did' in existing_columns:
+            essential_selects.append('did')
+        else:
+            essential_selects.append("'c not found' as did")
+
+        if 'token_id' in existing_columns:
+            essential_selects.append('token_id')
+        else:
+            essential_selects.append("'c not found' as token_id")
+
+        query = f"SELECT {', '.join(essential_selects)} FROM TokensTable"
+        logger.info(f"Essential metadata query: {query}")
+
+        # Read essential data
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+
+        if not rows:
+            logger.warning(f"No tokens found in {node_name}")
+            return True  # Empty database is still "successful"
+
+        logger.info(f"Found {len(rows)} tokens for essential metadata capture")
+
+        # Prepare minimal records for insertion
+        essential_records = []
+        for row in rows:
+            did = safe_str(row[0]) if row[0] else 'c not found'
+            token_id = safe_str(row[1]) if row[1] else 'c not found'
+
+            # Create minimal record with essential fields only
+            essential_records.append((
+                source_ip,           # source_ip
+                node_name,          # node_name
+                did,                # did
+                token_id,           # token_id
+                None,               # created_at (NULL)
+                None,               # updated_at (NULL)
+                'essential_only',   # token_status (marker)
+                None,               # parent_token_id (NULL)
+                None,               # token_value (NULL)
+                None,               # ipfs_data (NULL)
+                False,              # ipfs_fetched (False)
+                'essential_capture_only',  # ipfs_error (marker)
+                db_path,            # db_path
+                None,               # ipfs_path (NULL)
+                datetime.now(),     # synced_at
+                datetime.fromtimestamp(os.path.getmtime(db_path))  # db_last_modified
+            ))
+
+        # Insert essential records using existing bulk insert
+        if essential_records:
+            # Convert to TokenRecord objects for compatibility
+            token_records = []
+            for record_tuple in essential_records:
+                token_record = TokenRecord(
+                    source_ip=record_tuple[0],
+                    node_name=record_tuple[1],
+                    did=record_tuple[2],
+                    token_id=record_tuple[3],
+                    created_at=record_tuple[4],
+                    updated_at=record_tuple[5],
+                    token_status=record_tuple[6],
+                    parent_token_id=record_tuple[7],
+                    token_value=record_tuple[8],
+                    ipfs_data=record_tuple[9],
+                    ipfs_fetched=record_tuple[10],
+                    ipfs_error=record_tuple[11],
+                    db_path=record_tuple[12],
+                    ipfs_path=record_tuple[13],
+                    db_last_modified=record_tuple[15]
+                )
+                token_records.append(token_record)
+
+            # Use conflict resolution to avoid duplicates
+            success_count, error_count = bulk_insert_tokens(token_records,
+                                                          conflict_resolution='UPDATE' if force_update else 'IGNORE')
+
+            logger.info(f"Essential metadata capture: {success_count} inserted, {error_count} errors")
+
+            audit_logger.log_with_context(
+                logger, logging.INFO,
+                f"Essential metadata captured for {node_name}: {success_count} records",
+                component='ESSENTIAL', operation='METADATA_CAPTURE',
+                extra_data={
+                    'node_name': node_name,
+                    'db_path': db_path,
+                    'tokens_processed': len(rows),
+                    'successful_inserts': success_count,
+                    'failed_inserts': error_count,
+                    'force_update': force_update
+                }
+            )
+
+            return error_count == 0
+
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to ensure essential metadata for {db_path}: {e}")
+        audit_logger.log_with_context(
+            logger, logging.ERROR,
+            f"Essential metadata capture failed: {e}",
+            component='ESSENTIAL', operation='METADATA_CAPTURE',
+            extra_data={'db_path': db_path, 'error': str(e)},
+            exc_info=True
+        )
+        return False
+
+
+def run_essential_metadata_capture() -> bool:
+    """
+    Run essential metadata capture for all databases.
+    This is a lightweight alternative to full sync that captures only
+    core fields (token_id, did, source_ip, node_name) without IPFS processing.
+
+    Returns:
+        bool: True if all essential metadata was captured successfully
+    """
+    try:
+        print("🔍 Initializing essential metadata capture...")
+
+        # Get public IP
+        source_ip = get_public_ip()
+        print(f"📡 Source IP: {source_ip}")
+
+        # Initialize connection pool
+        init_connection_pool()
+        print("🔗 Database connection established")
+
+        # Create tables if needed
+        create_azure_sql_tables()
+        print("📊 Database tables ready")
+
+        # Find all databases
+        search_path = os.path.join('..', 'Node') if os.path.exists('../Node') else '..'
+        databases = find_rubix_databases(search_path)
+
+        if not databases:
+            print("❌ No rubix.db files found")
+            return False
+
+        print(f"📁 Found {len(databases)} database files")
+
+        # Process each database for essential metadata
+        successful_count = 0
+        failed_count = 0
+
+        print("🔄 Processing databases for essential metadata...")
+        print(f"{'Node':<20} {'Status':<15} {'Records':<10} {'Result'}")
+        print("-" * 60)
+
+        for idx, (db_path, _) in enumerate(databases, 1):
+            node_name = extract_node_name(db_path)
+
+            try:
+                # Show progress
+                progress = (idx / len(databases)) * 100
+                print(f"[{progress:5.1f}%] Processing {node_name}...", end=" ", flush=True)
+
+                # Capture essential metadata
+                success = ensure_essential_metadata(db_path, source_ip, force_update=False)
+
+                if success:
+                    print(f"✅ Success")
+                    successful_count += 1
+                else:
+                    print(f"❌ Failed")
+                    failed_count += 1
+
+            except Exception as e:
+                print(f"❌ Error: {e}")
+                failed_count += 1
+
+        # Summary
+        print("\n" + "=" * 60)
+        print("📊 Essential Metadata Capture Summary:")
+        print(f"   ✅ Successful: {successful_count}")
+        print(f"   ❌ Failed: {failed_count}")
+        print(f"   📊 Total: {len(databases)}")
+        print(f"   🎯 Success Rate: {(successful_count/len(databases)*100):.1f}%")
+
+        if failed_count == 0:
+            print("\n🎉 All databases processed successfully!")
+            print("💾 Essential metadata (token_id, did, source_ip, node_name) captured for all nodes")
+            return True
+        else:
+            print(f"\n⚠️  {failed_count} databases had issues - check logs for details")
+            return successful_count > 0  # Return True if at least some succeeded
+
+    except Exception as e:
+        print(f"❌ Essential metadata capture failed: {e}")
+        logger.error(f"Essential metadata capture failed: {e}", exc_info=True)
+        return False
+    finally:
+        # Close connection pool
+        if 'connection_pool' in globals() and connection_pool:
+            try:
+                connection_pool.close()
+                print("🔒 Database connections closed")
+            except:
+                pass
+
+
 def create_azure_sql_tables():
     """Create TokenRecords and ProcessedDatabases tables in Azure SQL Database with optimized schema."""
     pool = init_connection_pool()
@@ -1474,6 +1719,14 @@ def process_database(db_path: str, db_last_modified: float, source_ip: str, scri
         return []
     except Exception as e:
         logger.error(f"Unexpected error processing {db_path}: {e}")
+
+        # Fallback: Ensure essential metadata is captured even if processing failed
+        logger.info(f"Attempting essential metadata capture as fallback for {db_path}")
+        if ensure_essential_metadata(db_path, source_ip):
+            logger.info(f"Essential metadata captured successfully as fallback for {extract_node_name(db_path)}")
+        else:
+            logger.error(f"Failed to capture essential metadata for {extract_node_name(db_path)}")
+
         return []
 
 
@@ -2372,6 +2625,8 @@ if __name__ == "__main__":
                         help='Force IPFS fetch for all tokens (even if already fetched)')
     parser.add_argument('--cleanup-locks', action='store_true',
                         help='Clean up records with IPFS lock errors for retry')
+    parser.add_argument('--essential-only', action='store_true',
+                        help='Capture only essential metadata (token_id, did, source_ip, node_name) without IPFS processing')
 
     args = parser.parse_args()
 
@@ -2391,6 +2646,15 @@ if __name__ == "__main__":
             print("❌ Failed to clean up lock errors. Exiting.")
             sys.exit(1)
         print()
+
+    if args.essential_only:
+        print("📋 Essential metadata capture mode: Capturing only core data (token_id, did, source_ip, node_name)")
+        print("⚡ Skipping IPFS processing for faster execution")
+        if not run_essential_metadata_capture():
+            print("❌ Failed to capture essential metadata. Exiting.")
+            sys.exit(1)
+        print("✅ Essential metadata capture completed successfully!")
+        sys.exit(0)
 
     if args.force_ipfs:
         print("🔄 Force IPFS mode: Will re-fetch all IPFS data")

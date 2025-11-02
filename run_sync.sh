@@ -198,6 +198,9 @@ run_sync() {
     if [[ "$CLEANUP_LOCKS" == true ]]; then
         sync_cmd+=" --cleanup-locks"
     fi
+    if [[ "$ESSENTIAL_ONLY" == true ]]; then
+        sync_cmd+=" --essential-only"
+    fi
 
     print_status "Executing: $sync_cmd"
 
@@ -275,6 +278,7 @@ show_help() {
     echo "  --clear          Clear all existing records before sync"
     echo "  --force-ipfs     Force IPFS fetch for all tokens (re-fetch)"
     echo "  --cleanup-locks  Clean up IPFS lock errors from database"
+    echo "  --essential-only Capture only essential metadata (fast, no IPFS)"
     echo "  --test-only      Only test connections, don't run sync"
     echo "  --background     Run in background (nohup)"
     echo "  --help           Show this help message"
@@ -284,6 +288,7 @@ show_help() {
     echo "  $0 --clear --force-ipfs    # Complete fresh sync (delete all + re-fetch)"
     echo "  $0 --force-ipfs           # Re-fetch IPFS data only"
     echo "  $0 --cleanup-locks        # Clean up IPFS lock errors only"
+    echo "  $0 --essential-only       # Fast metadata capture (no IPFS processing)"
     echo "  $0 --test-only            # Test connections only"
     echo "  $0 --background           # Run in background"
     echo ""
@@ -310,6 +315,7 @@ main() {
     CLEAR_DATA=false
     FORCE_IPFS=false
     CLEANUP_LOCKS=false
+    ESSENTIAL_ONLY=false
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -331,6 +337,10 @@ main() {
                 ;;
             --cleanup-locks)
                 CLEANUP_LOCKS=true
+                shift
+                ;;
+            --essential-only)
+                ESSENTIAL_ONLY=true
                 shift
                 ;;
             --help)
@@ -374,6 +384,7 @@ main() {
     echo "   📊 Clear existing data: $(if [[ "$CLEAR_DATA" == true ]]; then echo "✅ YES (will delete all records)"; else echo "❌ NO (incremental sync)"; fi)"
     echo "   🔄 Force IPFS fetch: $(if [[ "$FORCE_IPFS" == true ]]; then echo "✅ YES (re-fetch all IPFS data)"; else echo "❌ NO (use cached data)"; fi)"
     echo "   🔧 Cleanup lock errors: $(if [[ "$CLEANUP_LOCKS" == true ]]; then echo "✅ YES (will fix IPFS lock conflicts)"; else echo "❌ NO (skip lock cleanup)"; fi)"
+    echo "   📋 Essential metadata only: $(if [[ "$ESSENTIAL_ONLY" == true ]]; then echo "✅ YES (fast capture, no IPFS)"; else echo "❌ NO (full processing)"; fi)"
     echo "   🧪 Test only mode: $(if [[ "$TEST_ONLY" == true ]]; then echo "✅ YES"; else echo "❌ NO"; fi)"
     echo "   📱 Background mode: $(if [[ "$BACKGROUND" == true ]]; then echo "✅ YES"; else echo "❌ NO"; fi)"
 
@@ -392,6 +403,17 @@ main() {
         print_status "   • Uses batched deletion with progress monitoring"
         print_status "   • Re-attempts IPFS fetch for cleaned records"
         print_status "   • Safe operation - only fixes lock conflicts"
+    fi
+
+    # Info for essential metadata mode
+    if [[ "$ESSENTIAL_ONLY" == true ]]; then
+        echo ""
+        print_status "📋 Essential Metadata Capture Mode:"
+        print_status "   • Captures only core fields: token_id, did, source_ip, node_name"
+        print_status "   • Skips IPFS processing for much faster execution"
+        print_status "   • Ensures complete node coverage in database"
+        print_status "   • Ideal for initial data discovery and coverage verification"
+        print_status "   • Can be run as prerequisite before full IPFS sync"
     fi
 
     # Confirm before starting
