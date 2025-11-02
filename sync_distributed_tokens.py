@@ -1357,8 +1357,7 @@ def ensure_essential_metadata(db_path: str, source_ip: str, force_update: bool =
                 token_records.append(token_record)
 
             # Use conflict resolution to avoid duplicates
-            success_count, error_count = bulk_insert_tokens(token_records,
-                                                          conflict_resolution='UPDATE' if force_update else 'IGNORE')
+            success_count, error_count = bulk_insert_records(token_records)
 
             logger.info(f"Essential metadata capture: {success_count} inserted, {error_count} errors")
 
