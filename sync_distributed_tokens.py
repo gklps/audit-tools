@@ -861,6 +861,48 @@ def safe_timestamp(value) -> Optional[datetime]:
     return None
 
 
+def build_ipfs_path_mapping(databases: List[Tuple[str, float]]) -> Dict[str, str]:
+    """
+    Build a mapping of database paths to their corresponding .ipfs directories.
+    This pre-maps all IPFS paths to avoid repeated discovery during processing.
+
+    Returns:
+        Dict[db_path, ipfs_path] - Mapping of database paths to .ipfs directories
+    """
+    ipfs_mapping = {}
+
+    logger.info("🗂️  Building IPFS path mapping for all databases...")
+
+    for db_path, _ in databases:
+        node_name = extract_node_name(db_path)
+        ipfs_path = find_ipfs_directory(db_path)
+
+        if ipfs_path:
+            ipfs_mapping[db_path] = ipfs_path
+            logger.debug(f"  ✅ {node_name}: {ipfs_path}")
+        else:
+            logger.warning(f"  ❌ {node_name}: No .ipfs directory found")
+            ipfs_mapping[db_path] = None
+
+    # Summary statistics
+    valid_ipfs = sum(1 for path in ipfs_mapping.values() if path is not None)
+    total_dbs = len(databases)
+
+    logger.info(f"📊 IPFS Mapping Summary:")
+    logger.info(f"  Total databases: {total_dbs}")
+    logger.info(f"  Valid .ipfs paths: {valid_ipfs}")
+    logger.info(f"  Missing .ipfs: {total_dbs - valid_ipfs}")
+
+    # Show unique .ipfs directories found
+    unique_ipfs_dirs = set(path for path in ipfs_mapping.values() if path is not None)
+    logger.info(f"  Unique .ipfs directories: {len(unique_ipfs_dirs)}")
+    for ipfs_dir in sorted(unique_ipfs_dirs):
+        node_count = sum(1 for path in ipfs_mapping.values() if path == ipfs_dir)
+        logger.info(f"    {ipfs_dir} (used by {node_count} nodes)")
+
+    return ipfs_mapping
+
+
 def find_rubix_databases(start_path: str = '.') -> List[Tuple[str, float]]:
     """
     Recursively search for Rubix/rubix.db files.
@@ -1258,15 +1300,25 @@ def needs_processing(db_path: str, db_last_modified: float, processed_dbs: Dict[
     return db_last_modified > processed_dbs[db_path]
 
 
-def process_database(db_path: str, db_last_modified: float, source_ip: str, script_dir: str) -> List[Tuple]:
+def process_database(db_path: str, db_last_modified: float, source_ip: str, script_dir: str, ipfs_mapping: Dict[str, str]) -> List[Tuple]:
     """
     Process a single database: read tokens from SQLite and fetch IPFS data.
-    Returns list of records ready for PostgreSQL insertion.
+    Uses pre-mapped IPFS paths for efficiency.
+
+    Args:
+        db_path: Path to the SQLite database
+        db_last_modified: Last modified timestamp of the database
+        source_ip: Source IP address for audit tracking
+        script_dir: Script directory path
+        ipfs_mapping: Pre-built mapping of database paths to .ipfs directories
+
+    Returns:
+        List of records ready for Azure SQL insertion
     """
     try:
-        # Extract node name and find IPFS directory
+        # Extract node name and get pre-mapped IPFS directory
         node_name = extract_node_name(db_path)
-        ipfs_path = find_ipfs_directory(db_path)
+        ipfs_path = ipfs_mapping.get(db_path)
 
         logger.info(f"Processing {node_name}: {db_path}")
         if ipfs_path:
@@ -1808,6 +1860,12 @@ def main():
                 extra_data={'ipfs_command': IPFS_COMMAND}
             )
 
+            # Note: IPFS_PATH is set per-node dynamically - each folder has its own .ipfs
+            audit_logger.log_with_context(
+                logger, logging.INFO, "Using per-node IPFS_PATH detection (each folder has dedicated .ipfs)",
+                component='MAIN', operation='IPFS_PATH_SETUP'
+            )
+
             # Get public IP and initialize connection pool
             with OperationContext("GET_PUBLIC_IP", 'MAIN', logger, log_start=False):
                 source_ip = get_public_ip()
@@ -1858,6 +1916,27 @@ def main():
                         component='MAIN', operation='DATABASE_DISCOVERY'
                     )
                     return
+
+            # Build IPFS path mapping for all databases
+            with OperationContext("BUILD_IPFS_MAPPING", 'MAIN', logger):
+                ipfs_mapping = build_ipfs_path_mapping(databases)
+
+                # Send Telegram notification about IPFS mapping
+                if telegram_enabled:
+                    valid_ipfs = sum(1 for path in ipfs_mapping.values() if path is not None)
+                    total_dbs = len(databases)
+                    missing_ipfs = total_dbs - valid_ipfs
+
+                    mapping_msg = f"🗂️ IPFS Mapping Complete\n"
+                    mapping_msg += f"📊 Total databases: {total_dbs}\n"
+                    mapping_msg += f"✅ Valid .ipfs paths: {valid_ipfs}\n"
+                    if missing_ipfs > 0:
+                        mapping_msg += f"❌ Missing .ipfs: {missing_ipfs}\n"
+
+                    unique_ipfs_dirs = set(path for path in ipfs_mapping.values() if path is not None)
+                    mapping_msg += f"🗃️ Unique .ipfs directories: {len(unique_ipfs_dirs)}"
+
+                    send_telegram_notification(mapping_msg)
 
             # Get already processed databases
             with OperationContext("GET_PROCESSED_DATABASES", 'MAIN', logger, log_start=False):
@@ -1912,7 +1991,7 @@ def main():
 
                 # Process database and fetch IPFS data
                 with OperationContext(f"PROCESS_DATABASE_{Path(db_path).stem}", 'SYNC', sync_logger):
-                    records = process_database(db_path, db_last_modified, source_ip, script_dir)
+                    records = process_database(db_path, db_last_modified, source_ip, script_dir, ipfs_mapping)
 
                 if records:
                     # Update global metrics
