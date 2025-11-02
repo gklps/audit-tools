@@ -1877,7 +1877,8 @@ def cleanup_ipfs_lock_errors():
             conn.close()
             return True
 
-        print(f"🔍 Found {lock_error_count:,} records with IPFS lock errors")
+        print(f"🔍 Found {lock_error_count:,} records with IPFS lock errors", flush=True)
+        print("⚠️  These records will be deleted to allow retry", flush=True)
         response = input(f"Delete these records to allow retry? Type 'YES' to confirm: ")
 
         if response != 'YES':
@@ -1890,8 +1891,8 @@ def cleanup_ipfs_lock_errors():
         total_deleted = 0
         start_time = time.time()
 
-        print(f"🔄 Deleting {lock_error_count:,} records in batches of {batch_size:,}...")
-        print("📊 Progress monitoring:")
+        print(f"🔄 Deleting {lock_error_count:,} records in batches of {batch_size:,}...", flush=True)
+        print("📊 Progress monitoring:", flush=True)
 
         while True:
             batch_start = time.time()
@@ -1929,12 +1930,12 @@ def cleanup_ipfs_lock_errors():
                   f"{total_deleted:,}/{lock_error_count:,} | "
                   f"Rate: {avg_rate:,.0f}/s | "
                   f"ETA: {eta_mins:.1f}m | "
-                  f"Batch: {batch_time:.2f}s")
+                  f"Batch: {batch_time:.2f}s", flush=True)
 
             # Small delay to prevent overwhelming the database
             time.sleep(0.1)
 
-        print(f"✅ Successfully deleted {total_deleted:,} records with lock errors")
+        print(f"✅ Successfully deleted {total_deleted:,} records with lock errors", flush=True)
         conn.close()
         return True
 
