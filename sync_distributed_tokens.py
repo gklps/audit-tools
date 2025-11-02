@@ -15,6 +15,7 @@ import time
 import requests
 import json
 import pyodbc
+import argparse
 # import pandas as pd  # Removed - not used in the script
 from typing import List, Optional, Tuple, Dict, Any
 from multiprocessing import Pool, cpu_count
@@ -39,18 +40,45 @@ except ImportError:
 # Configuration
 AZURE_SQL_CONNECTION_STRING = "Server=tcp:rauditser.database.windows.net,1433;Initial Catalog=rauditd;Persist Security Info=False;User ID=rubix;Password={your_password};MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
 CONNECTION_CONFIG_FILE = 'azure_sql_connection.txt'
-# Try different IPFS paths - adjust based on your installation
-IPFS_COMMAND = None
-for ipfs_path in ['./ipfs', '../Node/creator/ipfs', '/usr/local/bin/ipfs', 'ipfs']:
-    try:
-        result = subprocess.run([ipfs_path, 'version'], capture_output=True, timeout=5)
-        if result.returncode == 0:
-            IPFS_COMMAND = ipfs_path
-            break
-    except:
-        continue
-if not IPFS_COMMAND:
-    IPFS_COMMAND = 'ipfs'  # Fallback to system PATH
+# Smart IPFS binary detection
+def find_ipfs_binary() -> str:
+    """Smart detection of IPFS binary location"""
+
+    # Search order: local, common locations, system PATH
+    search_paths = [
+        # Local to current directory
+        './ipfs',
+        '../ipfs',
+        '../../ipfs',
+        # Common installation paths
+        '/usr/local/bin/ipfs',
+        '/usr/bin/ipfs',
+        '/bin/ipfs',
+        # System PATH
+        'ipfs'
+    ]
+
+    # Also search in parent directories up to 3 levels
+    current_dir = Path.cwd()
+    for i in range(4):  # Check current and 3 parent levels
+        check_dir = current_dir if i == 0 else current_dir.parents[i-1]
+        ipfs_path = check_dir / 'ipfs'
+        if ipfs_path.exists() and ipfs_path.is_file():
+            search_paths.insert(0, str(ipfs_path))
+
+    for ipfs_path in search_paths:
+        try:
+            result = subprocess.run([ipfs_path, 'version'], capture_output=True, timeout=5)
+            if result.returncode == 0:
+                print(f"✅ Found IPFS binary: {ipfs_path}")
+                return ipfs_path
+        except:
+            continue
+
+    print("⚠️  Using fallback 'ipfs' command - ensure it's in PATH")
+    return 'ipfs'
+
+IPFS_COMMAND = find_ipfs_binary()
 TELEGRAM_CONFIG_FILE = 'telegram_config.json'
 
 # Performance tuning - Optimized for Azure SQL Database
@@ -827,30 +855,48 @@ def find_rubix_databases(start_path: str = '.') -> List[Tuple[str, float]]:
 
 def find_ipfs_directory(db_path: str) -> Optional[str]:
     """
-    Find .ipfs directory for a given rubix.db path.
-    Looks in parent directories and siblings.
-
-    For example: /mnt/drived/node032/Rubix/rubix.db
-    Should find: /mnt/drived/node032/.ipfs
+    Smart detection of .ipfs directory for a given rubix.db path.
+    Searches systematically through multiple locations.
     """
     db_path_obj = Path(db_path)
+    node_dir = db_path_obj.parent.parent  # Go up from Rubix/rubix.db to node directory
 
-    # Start from parent of Rubix directory (e.g., node032)
-    node_dir = db_path_obj.parent.parent
+    # Search locations in order of preference
+    search_locations = [
+        # 1. Node-specific .ipfs directory
+        node_dir / '.ipfs',
+        # 2. Parent directory of node
+        node_dir.parent / '.ipfs',
+        # 3. Two levels up (for nested structures)
+        node_dir.parent.parent / '.ipfs',
+        # 4. Current working directory and its parents
+        Path.cwd() / '.ipfs',
+        Path.cwd().parent / '.ipfs',
+        Path.cwd().parent.parent / '.ipfs',
+    ]
 
-    # Check for .ipfs in node directory
-    ipfs_path = node_dir / '.ipfs'
-    if ipfs_path.exists() and ipfs_path.is_dir():
-        logger.debug(f"Found IPFS dir: {ipfs_path}")
-        return str(ipfs_path)
+    # 5. Search for .ipfs in any directory containing the node directory name
+    node_name = node_dir.name
+    current_path = db_path_obj
+    for _ in range(6):  # Search up to 6 levels up
+        current_path = current_path.parent
+        if current_path == current_path.parent:  # Reached root
+            break
 
-    # Check parent directory
-    ipfs_path = node_dir.parent / '.ipfs'
-    if ipfs_path.exists() and ipfs_path.is_dir():
-        logger.debug(f"Found IPFS dir: {ipfs_path}")
-        return str(ipfs_path)
+        # Check for .ipfs in this level
+        search_locations.append(current_path / '.ipfs')
+        # Check for node-specific .ipfs
+        search_locations.append(current_path / node_name / '.ipfs')
 
-    logger.warning(f"No .ipfs directory found for {db_path}")
+    # Test each location
+    for ipfs_path in search_locations:
+        if ipfs_path.exists() and ipfs_path.is_dir():
+            # Verify it's a valid IPFS directory by checking for common IPFS files
+            if (ipfs_path / 'config').exists() or (ipfs_path / 'datastore').exists():
+                logger.debug(f"Found valid IPFS dir: {ipfs_path}")
+                return str(ipfs_path)
+
+    logger.warning(f"No valid .ipfs directory found for {db_path}")
     return None
 
 
@@ -896,10 +942,9 @@ def fetch_ipfs_data(token_id: str, ipfs_path: str, script_dir: str) -> Tuple[Opt
                 }
             )
 
-            # Run ipfs cat command
-            ipfs_cmd = os.path.join(script_dir, 'ipfs')
+            # Run ipfs cat command using globally detected IPFS binary
             result = subprocess.run(
-                [ipfs_cmd, 'cat', token_id],
+                [IPFS_COMMAND, 'cat', token_id],
                 capture_output=True,
                 text=True,
                 timeout=IPFS_TIMEOUT,
@@ -1624,6 +1669,48 @@ def generate_final_report():
 
     logger.info("=" * 80)
 
+def clear_all_records():
+    """Clear all existing TokenRecords to start fresh"""
+    try:
+        conn_str = load_azure_connection_string()
+        if not conn_str:
+            print("❌ Cannot load Azure SQL connection string")
+            return False
+
+        conn = pyodbc.connect(conn_str)
+        cursor = conn.cursor()
+
+        # Get current count
+        cursor.execute("SELECT COUNT(*) FROM [dbo].[TokenRecords]")
+        current_count = cursor.fetchone()[0]
+
+        if current_count == 0:
+            print("✅ No existing records to clear")
+            conn.close()
+            return True
+
+        # Confirm deletion
+        print(f"⚠️  About to delete {current_count:,} existing records")
+        response = input("Are you sure? Type 'YES' to confirm: ")
+
+        if response != 'YES':
+            print("❌ Deletion cancelled")
+            conn.close()
+            return False
+
+        # Delete all records
+        cursor.execute("DELETE FROM [dbo].[TokenRecords]")
+        conn.commit()
+
+        print(f"✅ Successfully deleted {current_count:,} records")
+        conn.close()
+        return True
+
+    except Exception as e:
+        print(f"❌ Error clearing records: {e}")
+        return False
+
+
 def main():
     """Main function to orchestrate the distributed token sync with Azure SQL Database."""
     # Start main operation with correlation tracking
@@ -1661,24 +1748,12 @@ def main():
                 extra_data={'script_directory': script_dir}
             )
 
-            # Verify IPFS executable exists
-            ipfs_exe = os.path.join(script_dir, 'ipfs')
-            if not os.path.exists(ipfs_exe):
-                audit_logger.log_with_context(
-                    logger, logging.WARNING, f"IPFS executable not found at {ipfs_exe}",
-                    component='MAIN', operation='IPFS_CHECK',
-                    extra_data={'ipfs_path': ipfs_exe, 'exists': False}
-                )
-                audit_logger.log_with_context(
-                    logger, logging.WARNING, "IPFS data will not be fetched",
-                    component='MAIN', operation='IPFS_CHECK'
-                )
-            else:
-                audit_logger.log_with_context(
-                    logger, logging.INFO, f"IPFS executable found at {ipfs_exe}",
-                    component='MAIN', operation='IPFS_CHECK',
-                    extra_data={'ipfs_path': ipfs_exe, 'exists': True}
-                )
+            # IPFS executable check already done during import - using smart detection
+            audit_logger.log_with_context(
+                logger, logging.INFO, f"Using IPFS binary: {IPFS_COMMAND}",
+                component='MAIN', operation='IPFS_CHECK',
+                extra_data={'ipfs_command': IPFS_COMMAND}
+            )
 
             # Get public IP and initialize connection pool
             with OperationContext("GET_PUBLIC_IP", 'MAIN', logger, log_start=False):
@@ -1989,4 +2064,26 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Distributed Token Sync with Azure SQL Database')
+    parser.add_argument('--clear', action='store_true',
+                        help='Clear all existing records before sync')
+    parser.add_argument('--force-ipfs', action='store_true',
+                        help='Force IPFS fetch for all tokens (even if already fetched)')
+
+    args = parser.parse_args()
+
+    print("🚀 Rubix Distributed Token Sync System")
+    print("=" * 50)
+
+    if args.clear:
+        print("🗑️  Clearing existing records...")
+        if not clear_all_records():
+            print("❌ Failed to clear records. Exiting.")
+            sys.exit(1)
+        print()
+
+    if args.force_ipfs:
+        print("🔄 Force IPFS mode: Will re-fetch all IPFS data")
+        print()
+
     main()
