@@ -1005,6 +1005,45 @@ def extract_node_name(db_path: str) -> str:
     return node_dir.name
 
 
+def clear_ipfs_lock(ipfs_path: str) -> bool:
+    """
+    Clear stale IPFS repository lock files.
+
+    Args:
+        ipfs_path: Path to the .ipfs directory
+
+    Returns:
+        bool: True if lock was cleared or didn't exist, False if unable to clear
+    """
+    try:
+        lock_file = Path(ipfs_path) / 'repo.lock'
+        if lock_file.exists():
+            logger.debug(f"Removing stale IPFS lock: {lock_file}")
+            lock_file.unlink()
+            return True
+        return True  # No lock file, so it's clear
+    except Exception as e:
+        logger.warning(f"Failed to clear IPFS lock {lock_file}: {e}")
+        return False
+
+
+def is_ipfs_daemon_running(ipfs_path: str) -> bool:
+    """
+    Check if IPFS daemon is already running for this repository.
+
+    Args:
+        ipfs_path: Path to the .ipfs directory
+
+    Returns:
+        bool: True if daemon is running, False otherwise
+    """
+    try:
+        api_file = Path(ipfs_path) / 'api'
+        return api_file.exists()
+    except:
+        return False
+
+
 def fetch_ipfs_data(token_id: str, ipfs_path: str, script_dir: str) -> Tuple[Optional[str], bool, Optional[str]]:
     """
     Fetch IPFS data for a token_id using ipfs cat with detailed logging.
@@ -1037,15 +1076,53 @@ def fetch_ipfs_data(token_id: str, ipfs_path: str, script_dir: str) -> Tuple[Opt
                 }
             )
 
-            # Run ipfs cat command using globally detected IPFS binary
-            result = subprocess.run(
-                [IPFS_COMMAND, 'cat', token_id],
-                capture_output=True,
-                text=True,
-                timeout=IPFS_TIMEOUT,
-                env=env,
-                cwd=script_dir
-            )
+            # Handle IPFS repository lock conflicts
+            max_lock_retries = 3
+            lock_retry_delay = 0.5  # seconds
+
+            for lock_attempt in range(max_lock_retries):
+                try:
+                    # Run ipfs cat command using globally detected IPFS binary
+                    result = subprocess.run(
+                        [IPFS_COMMAND, 'cat', token_id],
+                        capture_output=True,
+                        text=True,
+                        timeout=IPFS_TIMEOUT,
+                        env=env,
+                        cwd=script_dir
+                    )
+
+                    # Check for lock errors
+                    if result.returncode != 0 and 'repo.lock' in result.stderr:
+                        if lock_attempt < max_lock_retries - 1:  # Not the last attempt
+                            logger.debug(f"IPFS lock conflict for {token_id}, attempt {lock_attempt + 1}, clearing lock and retrying...")
+
+                            # Try to clear the lock and retry
+                            if clear_ipfs_lock(ipfs_path):
+                                time.sleep(lock_retry_delay * (lock_attempt + 1))  # Exponential backoff
+                                continue
+                            else:
+                                # If we can't clear the lock, fail this attempt
+                                break
+                        else:
+                            # Last attempt failed, return the lock error
+                            logger.warning(f"IPFS lock conflict persists for {token_id} after {max_lock_retries} attempts")
+                            break
+                    else:
+                        # No lock error, break out of retry loop
+                        break
+
+                except subprocess.TimeoutExpired:
+                    # Handle timeout separately - don't retry for timeouts
+                    duration = time.time() - operation_start
+                    limited_error = "IPFS timeout"
+
+                    log_ipfs_operation(
+                        token_id, 'FETCH', ipfs_path,
+                        duration=duration, success=False, error=limited_error
+                    )
+
+                    return (None, False, limited_error)
 
             duration = time.time() - operation_start
 
@@ -1774,6 +1851,56 @@ def generate_final_report():
 
     logger.info("=" * 80)
 
+def cleanup_ipfs_lock_errors():
+    """
+    Clean up existing records that have IPFS lock errors to allow retry.
+    This will delete records with 'repo.lock' errors so they can be re-processed.
+    """
+    try:
+        conn_str = get_azure_sql_connection_string()
+        if not conn_str:
+            print("❌ Cannot load Azure SQL connection string")
+            return False
+
+        conn = pyodbc.connect(conn_str)
+        cursor = conn.cursor()
+
+        # Find records with lock errors
+        cursor.execute("""
+            SELECT COUNT(*) FROM [dbo].[TokenRecords]
+            WHERE [ipfs_error] LIKE '%repo.lock%'
+        """)
+        lock_error_count = cursor.fetchone()[0]
+
+        if lock_error_count == 0:
+            print("✅ No IPFS lock error records found")
+            conn.close()
+            return True
+
+        print(f"🔍 Found {lock_error_count:,} records with IPFS lock errors")
+        response = input(f"Delete these records to allow retry? Type 'YES' to confirm: ")
+
+        if response != 'YES':
+            print("❌ Cleanup cancelled")
+            conn.close()
+            return False
+
+        # Delete records with lock errors
+        cursor.execute("""
+            DELETE FROM [dbo].[TokenRecords]
+            WHERE [ipfs_error] LIKE '%repo.lock%'
+        """)
+        conn.commit()
+
+        print(f"✅ Successfully deleted {lock_error_count:,} records with lock errors")
+        conn.close()
+        return True
+
+    except Exception as e:
+        print(f"❌ Error cleaning up lock errors: {e}")
+        return False
+
+
 def clear_all_records():
     """Clear all existing TokenRecords to start fresh"""
     try:
@@ -2200,6 +2327,8 @@ if __name__ == "__main__":
                         help='Clear all existing records before sync')
     parser.add_argument('--force-ipfs', action='store_true',
                         help='Force IPFS fetch for all tokens (even if already fetched)')
+    parser.add_argument('--cleanup-locks', action='store_true',
+                        help='Clean up records with IPFS lock errors for retry')
 
     args = parser.parse_args()
 
@@ -2210,6 +2339,13 @@ if __name__ == "__main__":
         print("🗑️  Clearing existing records...")
         if not clear_all_records():
             print("❌ Failed to clear records. Exiting.")
+            sys.exit(1)
+        print()
+
+    if args.cleanup_locks:
+        print("🔧 Cleaning up IPFS lock errors...")
+        if not cleanup_ipfs_lock_errors():
+            print("❌ Failed to clean up lock errors. Exiting.")
             sys.exit(1)
         print()
 
