@@ -644,12 +644,12 @@ def get_azure_sql_connection_string() -> str:
             logger.warning(f"Could not read Azure SQL connection file: {e}")
             sync_metrics.add_error("connection", f"Failed to read config file: {e}")
 
-    # Validate that password is set
-    if "{your_password}" in AZURE_SQL_CONNECTION_STRING:
+    # Validate that password is set (check the actual connection string being used, not the fallback)
+    if "{your_password}" in connection_string:
         logger.error("Password placeholder found in connection string. Please update the password.")
         raise ValueError("Azure SQL Database password not configured")
 
-    return AZURE_SQL_CONNECTION_STRING
+    return connection_string
 
 def init_connection_pool() -> AzureSQLConnectionPool:
     """Initialize the global connection pool"""
