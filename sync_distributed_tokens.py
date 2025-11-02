@@ -599,6 +599,8 @@ class AzureSQLConnectionPool:
                 return self.pool.pop()
             elif self.active_connections < self.pool_size:
                 self.active_connections += 1
+                # Debug: Log the connection string being used
+                logger.debug(f"Creating connection with string: {self.connection_string[:50]}...")
                 return pyodbc.connect(self.connection_string)
             else:
                 # Pool exhausted, wait and retry
@@ -639,9 +641,23 @@ def get_azure_sql_connection_string() -> str:
         try:
             with open(CONNECTION_CONFIG_FILE, 'r') as f:
                 content = f.read().strip()
+
+                # Handle corrupted/duplicated connection strings
                 if content and 'DRIVER=' in content:
-                    logger.info("Loaded Azure SQL connection string from config file")
-                    connection_string = content
+                    # Remove any duplicate/corrupted parts
+                    lines = content.split('\n')
+                    # Take the first line that starts with DRIVER and looks valid
+                    for line in lines:
+                        line = line.strip()
+                        if line.startswith('DRIVER=') and 'SERVER=' in line and 'DATABASE=' in line:
+                            # Check if it's not corrupted (no duplicate DRIVER= in same line)
+                            if line.count('DRIVER=') == 1 and line.count('SERVER=') == 1:
+                                logger.info("Loaded Azure SQL connection string from config file")
+                                connection_string = line
+                                break
+                    else:
+                        logger.warning("Connection string appears corrupted in config file")
+                        logger.info(f"Corrupted content: {content[:100]}...")
         except Exception as e:
             logger.warning(f"Could not read Azure SQL connection file: {e}")
             sync_metrics.add_error("connection", f"Failed to read config file: {e}")
@@ -658,6 +674,17 @@ def init_connection_pool() -> AzureSQLConnectionPool:
     global connection_pool
     if connection_pool is None:
         conn_string = get_azure_sql_connection_string()
+
+        # Test the connection before creating pool
+        logger.info("Testing Azure SQL connection before creating pool...")
+        try:
+            test_conn = pyodbc.connect(conn_string)
+            test_conn.close()
+            logger.info("Azure SQL connection test successful")
+        except Exception as e:
+            logger.error(f"Azure SQL connection test failed: {e}")
+            raise ValueError(f"Azure SQL Database connection failed: {e}")
+
         connection_pool = AzureSQLConnectionPool(conn_string)
         logger.info(f"Initialized Azure SQL connection pool with {CONNECTION_POOL_SIZE} connections")
     return connection_pool
@@ -998,6 +1025,10 @@ def process_token_ipfs(args: Tuple) -> TokenRecord:
 def create_azure_sql_tables():
     """Create TokenRecords and ProcessedDatabases tables in Azure SQL Database with optimized schema."""
     pool = init_connection_pool()
+
+    # Debug: Log the connection string being used by the pool
+    logger.info(f"Pool connection string: {pool.connection_string}")
+
     conn = pool.get_connection()
 
     try:
