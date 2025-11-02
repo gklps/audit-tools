@@ -633,13 +633,15 @@ def get_azure_sql_connection_string() -> str:
     """Get Azure SQL Database connection string from config file if available."""
     global AZURE_SQL_CONNECTION_STRING
 
+    connection_string = AZURE_SQL_CONNECTION_STRING  # Default fallback
+
     if os.path.exists(CONNECTION_CONFIG_FILE):
         try:
             with open(CONNECTION_CONFIG_FILE, 'r') as f:
                 content = f.read().strip()
-                if content and 'Server=tcp:' in content:
+                if content and 'DRIVER=' in content:
                     logger.info("Loaded Azure SQL connection string from config file")
-                    return content
+                    connection_string = content
         except Exception as e:
             logger.warning(f"Could not read Azure SQL connection file: {e}")
             sync_metrics.add_error("connection", f"Failed to read config file: {e}")
