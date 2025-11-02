@@ -1936,7 +1936,7 @@ def main():
                     unique_ipfs_dirs = set(path for path in ipfs_mapping.values() if path is not None)
                     mapping_msg += f"🗃️ Unique .ipfs directories: {len(unique_ipfs_dirs)}"
 
-                    send_telegram_notification(mapping_msg)
+                    notify_progress(mapping_msg)
 
             # Get already processed databases
             with OperationContext("GET_PROCESSED_DATABASES", 'MAIN', logger, log_start=False):
