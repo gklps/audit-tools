@@ -1,8 +1,15 @@
 #!/bin/bash
-# Rubix Token Sync - Run Script
-# This script runs the enhanced token sync with proper environment setup
+# Rubix Distributed Token Sync - Production Run Script
+# Updated with all latest improvements:
+# - IPFS pre-mapping for 500+ nodes
+# - SQLite schema compatibility (handles missing columns)
+# - Universal IPFS binary detection
+# - Azure SQL Database integration
+# - Telegram notifications
+# - Comprehensive error handling
+# - Command-line options: --clear, --force-ipfs
 
-set -e
+set -e  # Exit on any error
 
 # Colors for output
 RED='\033[0;31m'
@@ -52,14 +59,13 @@ check_prerequisites() {
 import sys
 try:
     import pyodbc
-    import pandas
     import requests
     print('✅ All required Python packages are available')
 except ImportError as e:
     print(f'❌ Missing Python package: {e}')
     sys.exit(1)
 " || {
-        print_error "Python dependencies not met. Run setup.sh first."
+        print_error "Python dependencies not met. Install with: pip3 install pyodbc requests"
         exit 1
     }
 
@@ -181,8 +187,19 @@ run_sync() {
     # Set Python path
     export PYTHONPATH="$(pwd):$PYTHONPATH"
 
+    # Build command with options
+    sync_cmd="python3 sync_distributed_tokens.py"
+    if [[ "$CLEAR_DATA" == true ]]; then
+        sync_cmd+=" --clear"
+    fi
+    if [[ "$FORCE_IPFS" == true ]]; then
+        sync_cmd+=" --force-ipfs"
+    fi
+
+    print_status "Executing: $sync_cmd"
+
     # Run the sync with proper error handling
-    if python3 sync_distributed_tokens.py; then
+    if eval "$sync_cmd"; then
         print_success "Sync completed successfully!"
 
         # Show completion summary
@@ -247,24 +264,37 @@ cleanup() {
 
 # Function to show help
 show_help() {
-    echo "Rubix Token Sync - Run Script"
+    echo "Rubix Distributed Token Sync - Production Run Script"
     echo ""
     echo "Usage: $0 [options]"
     echo ""
     echo "Options:"
+    echo "  --clear        Clear all existing records before sync"
+    echo "  --force-ipfs   Force IPFS fetch for all tokens (re-fetch)"
     echo "  --test-only    Only test connections, don't run sync"
     echo "  --background   Run in background (nohup)"
     echo "  --help         Show this help message"
     echo ""
     echo "Examples:"
-    echo "  $0                    # Run sync interactively"
-    echo "  $0 --test-only       # Test connections only"
-    echo "  $0 --background      # Run in background"
+    echo "  $0                         # Standard incremental sync"
+    echo "  $0 --clear --force-ipfs    # Complete fresh sync (delete all + re-fetch)"
+    echo "  $0 --force-ipfs           # Re-fetch IPFS data only"
+    echo "  $0 --test-only            # Test connections only"
+    echo "  $0 --background           # Run in background"
+    echo ""
+    echo "Features:"
+    echo "  🗂️  IPFS pre-mapping for 500+ nodes (fast discovery)"
+    echo "  📊 SQLite schema compatibility (handles missing columns)"
+    echo "  🔄 Universal IPFS binary detection"
+    echo "  🗄️  Azure SQL Database integration"
+    echo "  📱 Real-time Telegram notifications"
+    echo "  📊 Comprehensive audit logging"
     echo ""
     echo "Monitoring:"
     echo "  tail -f logs/sync_main_\$(date +%Y%m%d).log    # Watch main log"
-    echo "  ./scripts/monitor.sh                          # System monitor"
+    echo "  tail -f logs/sync_errors_\$(date +%Y%m%d).log  # Watch error log"
     echo "  python3 log_analyzer.py --hours 1             # Performance analysis"
+    echo "  Check 'Audit Bot' Telegram group for updates"
 }
 
 # Main function
@@ -272,9 +302,19 @@ main() {
     # Parse command line arguments
     TEST_ONLY=false
     BACKGROUND=false
+    CLEAR_DATA=false
+    FORCE_IPFS=false
 
     while [[ $# -gt 0 ]]; do
         case $1 in
+            --clear)
+                CLEAR_DATA=true
+                shift
+                ;;
+            --force-ipfs)
+                FORCE_IPFS=true
+                shift
+                ;;
             --test-only)
                 TEST_ONLY=true
                 shift
@@ -319,13 +359,35 @@ main() {
 
     show_pre_run_summary
 
-    # Confirm before starting
-    if [[ $BACKGROUND != true ]]; then
+    # Show sync options
+    print_status "🎯 Sync Configuration:"
+    echo "   📊 Clear existing data: $(if [[ "$CLEAR_DATA" == true ]]; then echo "✅ YES (will delete all records)"; else echo "❌ NO (incremental sync)"; fi)"
+    echo "   🔄 Force IPFS fetch: $(if [[ "$FORCE_IPFS" == true ]]; then echo "✅ YES (re-fetch all IPFS data)"; else echo "❌ NO (use cached data)"; fi)"
+    echo "   🧪 Test only mode: $(if [[ "$TEST_ONLY" == true ]]; then echo "✅ YES"; else echo "❌ NO"; fi)"
+    echo "   📱 Background mode: $(if [[ "$BACKGROUND" == true ]]; then echo "✅ YES"; else echo "❌ NO"; fi)"
+
+    # Warning for destructive operations
+    if [[ "$CLEAR_DATA" == true ]]; then
         echo ""
-        read -p "Ready to start sync? (y/n): " confirm
-        if [[ ! $confirm =~ ^[Yy]$ ]]; then
-            print_status "Sync cancelled by user."
-            exit 0
+        print_warning "⚠️  WARNING: --clear will DELETE ALL existing token records!"
+        print_warning "⚠️  This is irreversible. Make sure you want to start fresh."
+    fi
+
+    # Confirm before starting
+    if [[ $BACKGROUND != true && $TEST_ONLY != true ]]; then
+        echo ""
+        if [[ "$CLEAR_DATA" == true ]]; then
+            read -p "⚠️  Really delete all records and start fresh? Type 'YES' to confirm: " confirm
+            if [[ "$confirm" != "YES" ]]; then
+                print_status "Sync cancelled by user."
+                exit 0
+            fi
+        else
+            read -p "Ready to start sync? (y/n): " confirm
+            if [[ ! $confirm =~ ^[Yy]$ ]]; then
+                print_status "Sync cancelled by user."
+                exit 0
+            fi
         fi
     fi
 

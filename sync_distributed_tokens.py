@@ -1921,22 +1921,21 @@ def main():
             with OperationContext("BUILD_IPFS_MAPPING", 'MAIN', logger):
                 ipfs_mapping = build_ipfs_path_mapping(databases)
 
-                # Send Telegram notification about IPFS mapping
-                if telegram_enabled:
-                    valid_ipfs = sum(1 for path in ipfs_mapping.values() if path is not None)
-                    total_dbs = len(databases)
-                    missing_ipfs = total_dbs - valid_ipfs
+                # Log IPFS mapping summary (Telegram notification will be sent later during normal flow)
+                valid_ipfs = sum(1 for path in ipfs_mapping.values() if path is not None)
+                total_dbs = len(databases)
+                missing_ipfs = total_dbs - valid_ipfs
 
-                    mapping_msg = f"🗂️ IPFS Mapping Complete\n"
-                    mapping_msg += f"📊 Total databases: {total_dbs}\n"
-                    mapping_msg += f"✅ Valid .ipfs paths: {valid_ipfs}\n"
-                    if missing_ipfs > 0:
-                        mapping_msg += f"❌ Missing .ipfs: {missing_ipfs}\n"
-
-                    unique_ipfs_dirs = set(path for path in ipfs_mapping.values() if path is not None)
-                    mapping_msg += f"🗃️ Unique .ipfs directories: {len(unique_ipfs_dirs)}"
-
-                    notify_progress(mapping_msg)
+                audit_logger.log_with_context(
+                    logger, logging.INFO, f"IPFS mapping completed: {valid_ipfs}/{total_dbs} valid paths",
+                    component='MAIN', operation='IPFS_MAPPING_COMPLETE',
+                    extra_data={
+                        'total_databases': total_dbs,
+                        'valid_ipfs_paths': valid_ipfs,
+                        'missing_ipfs_paths': missing_ipfs,
+                        'unique_ipfs_dirs': len(set(path for path in ipfs_mapping.values() if path is not None))
+                    }
+                )
 
             # Get already processed databases
             with OperationContext("GET_PROCESSED_DATABASES", 'MAIN', logger, log_start=False):
