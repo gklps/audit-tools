@@ -39,12 +39,25 @@ print("=" * 40)
 try:
     from sync_distributed_tokens import find_ipfs_directory
 
-    # Test with a mock database path
+    # Test with realistic database paths from the actual structure
     test_paths = [
-        "./node123/Rubix/rubix.db",
-        "/fake/path/node456/Rubix/rubix.db",
-        str(Path.cwd() / "test_node" / "Rubix" / "rubix.db")
+        str(Path.cwd() / "node123" / "Rubix" / "rubix.db"),  # Simulated node in audit-tools
+        "/home/cherryrubix/wallets/node456/Rubix/rubix.db",   # Real structure
     ]
+
+    # Also check if .ipfs exists in expected locations
+    possible_ipfs_locations = [
+        "/home/cherryrubix/wallets/.ipfs",
+        str(Path.cwd().parent / ".ipfs"),
+        str(Path.cwd() / ".ipfs")
+    ]
+
+    print("🔍 Checking for .ipfs directories:")
+    for location in possible_ipfs_locations:
+        if Path(location).exists():
+            print(f"✅ Found .ipfs at: {location}")
+        else:
+            print(f"❌ No .ipfs at: {location}")
 
     for test_path in test_paths:
         ipfs_dir = find_ipfs_directory(test_path)
@@ -87,9 +100,9 @@ print()
 print("🧪 Test 4: Azure SQL Connection")
 print("=" * 40)
 try:
-    from sync_distributed_tokens import load_azure_connection_string
+    from sync_distributed_tokens import get_azure_sql_connection_string
 
-    conn_str = load_azure_connection_string()
+    conn_str = get_azure_sql_connection_string()
     if conn_str:
         print("✅ Connection string loaded successfully")
         # Test basic connection

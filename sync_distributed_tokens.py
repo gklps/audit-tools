@@ -42,30 +42,59 @@ AZURE_SQL_CONNECTION_STRING = "Server=tcp:rauditser.database.windows.net,1433;In
 CONNECTION_CONFIG_FILE = 'azure_sql_connection.txt'
 # Smart IPFS binary detection
 def find_ipfs_binary() -> str:
-    """Smart detection of IPFS binary location"""
+    """Universal IPFS binary detection for any VM setup"""
 
-    # Search order: local, common locations, system PATH
-    search_paths = [
-        # Local to current directory
-        './ipfs',
-        '../ipfs',
-        '../../ipfs',
-        # Common installation paths
-        '/usr/local/bin/ipfs',
-        '/usr/bin/ipfs',
-        '/bin/ipfs',
-        # System PATH
-        'ipfs'
-    ]
-
-    # Also search in parent directories up to 3 levels
+    search_paths = []
     current_dir = Path.cwd()
-    for i in range(4):  # Check current and 3 parent levels
+
+    # 1. Search current directory tree (up to 5 levels up)
+    for i in range(6):
         check_dir = current_dir if i == 0 else current_dir.parents[i-1]
+        if check_dir == check_dir.parent:  # Reached root
+            break
+
+        # Check for ipfs binary in this directory
         ipfs_path = check_dir / 'ipfs'
         if ipfs_path.exists() and ipfs_path.is_file():
-            search_paths.insert(0, str(ipfs_path))
+            search_paths.append(str(ipfs_path))
 
+    # 2. Search common sibling directories from current path
+    # If we're in /some/path/audit-tools, check /some/path/ipfs
+    for i in range(3):  # Check up to 3 levels
+        check_dir = current_dir.parents[i] if i < len(current_dir.parents) else None
+        if check_dir:
+            ipfs_path = check_dir / 'ipfs'
+            if ipfs_path.exists() and ipfs_path.is_file():
+                search_paths.append(str(ipfs_path))
+
+    # 3. Search home directory and common locations
+    home_dir = Path.home()
+    common_locations = [
+        home_dir / 'ipfs',
+        home_dir / 'bin' / 'ipfs',
+        home_dir / '.local' / 'bin' / 'ipfs',
+        Path('/usr/local/bin/ipfs'),
+        Path('/usr/bin/ipfs'),
+        Path('/bin/ipfs'),
+        Path('/opt/ipfs/ipfs'),
+    ]
+
+    for location in common_locations:
+        if location.exists() and location.is_file():
+            search_paths.append(str(location))
+
+    # 4. Search in PATH directories
+    path_env = os.environ.get('PATH', '')
+    for path_dir in path_env.split(':'):
+        if path_dir:
+            ipfs_path = Path(path_dir) / 'ipfs'
+            if ipfs_path.exists() and ipfs_path.is_file():
+                search_paths.append(str(ipfs_path))
+
+    # 5. Add fallback system command
+    search_paths.extend(['./ipfs', '../ipfs', 'ipfs'])
+
+    # Test each path
     for ipfs_path in search_paths:
         try:
             result = subprocess.run([ipfs_path, 'version'], capture_output=True, timeout=5)
@@ -855,48 +884,72 @@ def find_rubix_databases(start_path: str = '.') -> List[Tuple[str, float]]:
 
 def find_ipfs_directory(db_path: str) -> Optional[str]:
     """
-    Smart detection of .ipfs directory for a given rubix.db path.
-    Searches systematically through multiple locations.
+    Find .ipfs directory based on logical pattern:
+    If DB is at /mnt/drived/node056/Rubix/rubix.db
+    Then .ipfs should be at /mnt/drived/.ipfs
+
+    Pattern: Walk up from node directory to find the common root with .ipfs
     """
     db_path_obj = Path(db_path)
-    node_dir = db_path_obj.parent.parent  # Go up from Rubix/rubix.db to node directory
 
-    # Search locations in order of preference
-    search_locations = [
-        # 1. Node-specific .ipfs directory
-        node_dir / '.ipfs',
-        # 2. Parent directory of node
-        node_dir.parent / '.ipfs',
-        # 3. Two levels up (for nested structures)
-        node_dir.parent.parent / '.ipfs',
-        # 4. Current working directory and its parents
-        Path.cwd() / '.ipfs',
-        Path.cwd().parent / '.ipfs',
-        Path.cwd().parent.parent / '.ipfs',
-    ]
+    # Start from the node directory (parent of Rubix)
+    # e.g., /mnt/drived/node056/Rubix/rubix.db -> /mnt/drived/node056
+    node_dir = db_path_obj.parent.parent
 
-    # 5. Search for .ipfs in any directory containing the node directory name
-    node_name = node_dir.name
-    current_path = db_path_obj
-    for _ in range(6):  # Search up to 6 levels up
-        current_path = current_path.parent
-        if current_path == current_path.parent:  # Reached root
-            break
+    # Walk up the directory tree to find .ipfs
+    current_path = node_dir
+    max_levels = 6  # Reasonable limit to prevent infinite loops
 
-        # Check for .ipfs in this level
-        search_locations.append(current_path / '.ipfs')
-        # Check for node-specific .ipfs
-        search_locations.append(current_path / node_name / '.ipfs')
+    for level in range(max_levels):
+        # Check for .ipfs at this level
+        ipfs_path = current_path.parent / '.ipfs'
 
-    # Test each location
-    for ipfs_path in search_locations:
+        logger.debug(f"  Checking level {level}: {ipfs_path}")
+
         if ipfs_path.exists() and ipfs_path.is_dir():
-            # Verify it's a valid IPFS directory by checking for common IPFS files
-            if (ipfs_path / 'config').exists() or (ipfs_path / 'datastore').exists():
+            # Verify it's a valid IPFS directory
+            ipfs_indicators = [
+                ipfs_path / 'config',
+                ipfs_path / 'datastore',
+                ipfs_path / 'keystore',
+                ipfs_path / 'blocks',
+                ipfs_path / 'version'
+            ]
+
+            if any(indicator.exists() for indicator in ipfs_indicators):
                 logger.debug(f"Found valid IPFS dir: {ipfs_path}")
                 return str(ipfs_path)
 
+        # Move up one level
+        current_path = current_path.parent
+
+        # Stop if we've reached the root
+        if current_path == current_path.parent:
+            break
+
+    # If pattern-based search fails, check a few common fallback locations
+    fallback_locations = [
+        node_dir / '.ipfs',  # Node-specific .ipfs
+        Path.cwd().parent / '.ipfs',  # Current working directory parent
+        Path.home() / '.ipfs',  # User home directory
+    ]
+
+    for ipfs_path in fallback_locations:
+        if ipfs_path.exists() and ipfs_path.is_dir():
+            ipfs_indicators = [
+                ipfs_path / 'config',
+                ipfs_path / 'datastore',
+                ipfs_path / 'keystore',
+                ipfs_path / 'blocks',
+                ipfs_path / 'version'
+            ]
+
+            if any(indicator.exists() for indicator in ipfs_indicators):
+                logger.debug(f"Found IPFS dir (fallback): {ipfs_path}")
+                return str(ipfs_path)
+
     logger.warning(f"No valid .ipfs directory found for {db_path}")
+    logger.debug(f"  Searched from node dir: {node_dir}")
     return None
 
 
@@ -1672,7 +1725,7 @@ def generate_final_report():
 def clear_all_records():
     """Clear all existing TokenRecords to start fresh"""
     try:
-        conn_str = load_azure_connection_string()
+        conn_str = get_azure_sql_connection_string()
         if not conn_str:
             print("❌ Cannot load Azure SQL connection string")
             return False
