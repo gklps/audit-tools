@@ -1,0 +1,16 @@
+# Azure SQL Database Connection String Template
+# Copy this file to azure_sql_connection.txt and update with your credentials
+#
+# IMPORTANT: Replace {your_password} with the actual password for the 'rubix' user
+# SECURITY: This file contains sensitive credentials - do not commit to version control
+
+Server=tcp:rauditser.database.windows.net,1433;Initial Catalog=rauditd;Persist Security Info=False;User ID=rubix;Password={your_password};MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;
+
+# Connection string breakdown:
+# - Server: Azure SQL Database server endpoint
+# - Initial Catalog: Database name (rauditd)
+# - User ID: Database username (rubix)
+# - Password: Database password (REPLACE {your_password})
+# - Encrypt=True: Forces SSL encryption
+# - Connection Timeout: 30 seconds timeout for initial connection
+# - MultipleActiveResultSets=False: Optimized for single result sets per connection

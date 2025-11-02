@@ -1,0 +1,102 @@
+# Rubix Token Sync - Git Ignore File
+
+# Configuration files with sensitive data
+azure_sql_connection.txt
+telegram_config.json
+postgres_connection.txt
+
+# Log files
+logs/
+*.log
+sync_*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Backup files
+*.backup
+*.bak
+*.old
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Database files (if any local copies)
+*.db
+*.sqlite
+*.sqlite3
+
+# Reports and analysis outputs
+sync_report_*.json
+performance_metrics.csv
+*.csv
+
+# Runtime files
+*.pid
+nohup.out
+sync_output.log
+sync_background.log
+setup.log
+sync_run.log
+
+# IPFS data (if stored locally)
+.ipfs/
+
+# Node modules (if any)
+node_modules/
+
+# Archive files
+*.zip
+*.tar.gz
+*.tar.bz2
+*.rar
+*.7z
+
+# Configuration backups
+config/*.backup
+config/*.bak

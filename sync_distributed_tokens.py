@@ -1,0 +1,1931 @@
+#!/usr/bin/env python3
+"""
+Distributed Token Sync Service with IPFS Integration
+
+Scans directories for Rubix/rubix.db files, reads TokensTable data,
+fetches IPFS metadata via ipfs cat, and syncs everything to Azure SQL Database.
+"""
+
+import os
+import sqlite3
+import subprocess
+import logging
+import sys
+import time
+import requests
+import json
+import pyodbc
+import pandas as pd
+from typing import List, Optional, Tuple, Dict, Any
+from multiprocessing import Pool, cpu_count
+from datetime import datetime, timezone
+from pathlib import Path
+from dataclasses import dataclass, asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+
+# Import Telegram notifications
+try:
+    from telegram_notifier import (
+        init_telegram_notifier, notify_startup, notify_progress,
+        notify_error, notify_completion, notify_database_completed,
+        update_machine_info, shutdown_telegram
+    )
+    TELEGRAM_AVAILABLE = True
+except ImportError:
+    TELEGRAM_AVAILABLE = False
+    print("Telegram notifications not available - telegram_notifier module not found")
+
+# Configuration
+AZURE_SQL_CONNECTION_STRING = "Server=tcp:rauditser.database.windows.net,1433;Initial Catalog=rauditd;Persist Security Info=False;User ID=rubix;Password={your_password};MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
+CONNECTION_CONFIG_FILE = '/datadrive/Rubix/azure_sql_connection.txt'
+IPFS_COMMAND = './ipfs'
+TELEGRAM_CONFIG_FILE = '/datadrive/Rubix/telegram_config.json'
+
+# Performance tuning - Optimized for Azure SQL Database
+NUM_DB_WORKERS = max(1, cpu_count() // 2)  # Parallel database processing
+NUM_IPFS_WORKERS = cpu_count() * 2  # Increased for better IPFS throughput
+BATCH_SIZE = 2000  # Larger batches for Azure SQL Database efficiency
+BULK_INSERT_SIZE = 10000  # Use bulk insert for large datasets
+IPFS_TIMEOUT = 12  # Reduced timeout for faster failover
+CONNECTION_POOL_SIZE = 10  # Connection pool for Azure SQL
+RETRY_ATTEMPTS = 3  # Retry failed operations
+PROGRESS_REPORT_INTERVAL = 100  # Report progress every N records
+
+# Data validation and quality settings
+VALIDATE_TOKEN_FORMAT = True
+VALIDATE_IPFS_DATA = True
+MAX_ERROR_LOG_SIZE = 1000  # Maximum errors to keep in memory
+
+# Enhanced logging configuration with detailed audit trails
+import logging.handlers
+from logging.handlers import RotatingFileHandler
+import uuid
+import traceback
+
+# Create custom formatter for structured logging
+class AuditFormatter(logging.Formatter):
+    """Custom formatter that adds structured data for audit trails"""
+
+    def format(self, record):
+        # Add correlation ID if not present
+        if not hasattr(record, 'correlation_id'):
+            record.correlation_id = getattr(logging.getLoggerClass(), '_correlation_id', 'N/A')
+
+        # Add component if not present
+        if not hasattr(record, 'component'):
+            record.component = 'MAIN'
+
+        # Add operation if not present
+        if not hasattr(record, 'operation'):
+            record.operation = 'GENERAL'
+
+        # Create base log entry
+        base_msg = super().format(record)
+
+        # Add structured data for audit
+        audit_data = {
+            'timestamp': record.created,
+            'level': record.levelname,
+            'component': record.component,
+            'operation': record.operation,
+            'correlation_id': record.correlation_id,
+            'thread_id': record.thread,
+            'process_id': record.process
+        }
+
+        # Add extra context if available
+        if hasattr(record, 'extra_data'):
+            audit_data.update(record.extra_data)
+
+        # Format as: TIMESTAMP - LEVEL - COMPONENT:OPERATION [CORRELATION_ID] - MESSAGE
+        formatted = f"{record.asctime} - {record.levelname} - {record.component}:{record.operation} [{record.correlation_id}] - {record.getMessage()}"
+
+        # Add stack trace for errors
+        if record.levelname in ['ERROR', 'CRITICAL'] and record.exc_info:
+            formatted += f"\nStack Trace: {self.formatException(record.exc_info)}"
+
+        return formatted
+
+# Setup comprehensive logging with multiple handlers
+def setup_detailed_logging():
+    """Setup detailed logging with multiple log files and audit trails"""
+
+    # Create logs directory
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+
+    # Get current timestamp for log file naming
+    timestamp = datetime.now().strftime("%Y%m%d")
+
+    # Main application logger
+    main_logger = logging.getLogger(__name__)
+    main_logger.setLevel(logging.DEBUG)
+
+    # Remove existing handlers
+    for handler in main_logger.handlers[:]:
+        main_logger.removeHandler(handler)
+
+    # Custom formatter
+    formatter = AuditFormatter(
+        fmt='%(asctime)s - %(levelname)s - %(component)s:%(operation)s [%(correlation_id)s] - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # 1. Main application log (rotating)
+    main_handler = RotatingFileHandler(
+        log_dir / f"sync_main_{timestamp}.log",
+        maxBytes=100*1024*1024,  # 100MB
+        backupCount=10
+    )
+    main_handler.setLevel(logging.INFO)
+    main_handler.setFormatter(formatter)
+
+    # 2. Debug log with everything (rotating)
+    debug_handler = RotatingFileHandler(
+        log_dir / f"sync_debug_{timestamp}.log",
+        maxBytes=200*1024*1024,  # 200MB
+        backupCount=5
+    )
+    debug_handler.setLevel(logging.DEBUG)
+    debug_handler.setFormatter(formatter)
+
+    # 3. Error-only log (permanent retention)
+    error_handler = RotatingFileHandler(
+        log_dir / f"sync_errors_{timestamp}.log",
+        maxBytes=50*1024*1024,  # 50MB
+        backupCount=50  # Keep more error logs
+    )
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(formatter)
+
+    # 4. Console output (clean format)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    console_handler.setFormatter(console_formatter)
+
+    # Add all handlers
+    main_logger.addHandler(main_handler)
+    main_logger.addHandler(debug_handler)
+    main_logger.addHandler(error_handler)
+    main_logger.addHandler(console_handler)
+
+    return main_logger
+
+# Component-specific loggers
+def get_component_logger(component_name: str):
+    """Get a logger for a specific component with proper context"""
+    logger = logging.getLogger(f"{__name__}.{component_name}")
+
+    # Create component-specific log file
+    log_dir = Path("logs")
+    timestamp = datetime.now().strftime("%Y%m%d")
+
+    if not any(isinstance(h, RotatingFileHandler) and component_name in str(h.baseFilename)
+               for h in logger.handlers):
+        component_handler = RotatingFileHandler(
+            log_dir / f"sync_{component_name.lower()}_{timestamp}.log",
+            maxBytes=50*1024*1024,  # 50MB
+            backupCount=10
+        )
+        component_handler.setLevel(logging.DEBUG)
+        component_handler.setFormatter(AuditFormatter(
+            fmt='%(asctime)s - %(levelname)s - %(operation)s [%(correlation_id)s] - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        ))
+        logger.addHandler(component_handler)
+
+    return logger
+
+# Setup logging system
+logger = setup_detailed_logging()
+ipfs_logger = get_component_logger('IPFS')
+sql_logger = get_component_logger('SQL')
+validation_logger = get_component_logger('VALIDATION')
+sync_logger = get_component_logger('SYNC')
+
+# Thread-safe logging for parallel operations
+log_lock = threading.Lock()
+
+# Audit logging utilities
+class AuditLogger:
+    """Centralized audit logging with correlation tracking"""
+
+    def __init__(self):
+        self.correlation_stack = []
+        self.operation_stack = []
+
+    def start_operation(self, operation_name: str, correlation_id: str = None) -> str:
+        """Start a new operation with correlation tracking"""
+        if correlation_id is None:
+            correlation_id = str(uuid.uuid4())[:8]
+
+        self.correlation_stack.append(correlation_id)
+        self.operation_stack.append(operation_name)
+
+        # Set correlation ID on logger class for thread safety
+        logging.getLoggerClass()._correlation_id = correlation_id
+
+        return correlation_id
+
+    def end_operation(self):
+        """End the current operation"""
+        if self.correlation_stack:
+            self.correlation_stack.pop()
+        if self.operation_stack:
+            self.operation_stack.pop()
+
+        # Update correlation ID
+        correlation_id = self.correlation_stack[-1] if self.correlation_stack else 'N/A'
+        logging.getLoggerClass()._correlation_id = correlation_id
+
+    def log_with_context(self, logger, level, message, component='MAIN', operation=None,
+                        extra_data=None, exc_info=None):
+        """Log with full context and audit trail"""
+        if operation is None:
+            operation = self.operation_stack[-1] if self.operation_stack else 'GENERAL'
+
+        correlation_id = self.correlation_stack[-1] if self.correlation_stack else 'N/A'
+
+        # Create log record with full context
+        record_extra = {
+            'component': component,
+            'operation': operation,
+            'correlation_id': correlation_id,
+            'extra_data': extra_data or {}
+        }
+
+        if exc_info:
+            logger.log(level, message, extra=record_extra, exc_info=exc_info)
+        else:
+            logger.log(level, message, extra=record_extra)
+
+# Global audit logger instance
+audit_logger = AuditLogger()
+
+# Context manager for operations
+class OperationContext:
+    """Context manager for tracking operations with automatic logging"""
+
+    def __init__(self, operation_name: str, component: str = 'MAIN',
+                 logger_instance=None, log_start=True, log_end=True):
+        self.operation_name = operation_name
+        self.component = component
+        self.logger_instance = logger_instance or logger
+        self.log_start = log_start
+        self.log_end = log_end
+        self.correlation_id = None
+        self.start_time = None
+        self.success = False
+
+    def __enter__(self):
+        self.correlation_id = audit_logger.start_operation(self.operation_name)
+        self.start_time = datetime.now(timezone.utc)
+
+        if self.log_start:
+            audit_logger.log_with_context(
+                self.logger_instance, logging.INFO,
+                f"Starting {self.operation_name}",
+                component=self.component,
+                operation=self.operation_name,
+                extra_data={'start_time': self.start_time.isoformat()}
+            )
+
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        end_time = datetime.now(timezone.utc)
+        duration = (end_time - self.start_time).total_seconds()
+
+        if exc_type is None:
+            self.success = True
+            if self.log_end:
+                audit_logger.log_with_context(
+                    self.logger_instance, logging.INFO,
+                    f"Completed {self.operation_name} successfully",
+                    component=self.component,
+                    operation=self.operation_name,
+                    extra_data={
+                        'duration_seconds': duration,
+                        'end_time': end_time.isoformat(),
+                        'success': True
+                    }
+                )
+        else:
+            self.success = False
+            error_details = {
+                'duration_seconds': duration,
+                'end_time': end_time.isoformat(),
+                'success': False,
+                'error_type': exc_type.__name__,
+                'error_message': str(exc_val),
+                'stack_trace': traceback.format_exc()
+            }
+
+            audit_logger.log_with_context(
+                self.logger_instance, logging.ERROR,
+                f"Failed {self.operation_name}: {exc_val}",
+                component=self.component,
+                operation=self.operation_name,
+                extra_data=error_details,
+                exc_info=(exc_type, exc_val, exc_tb)
+            )
+
+        audit_logger.end_operation()
+
+    def add_context(self, key: str, value: Any):
+        """Add additional context to the operation"""
+        audit_logger.log_with_context(
+            self.logger_instance, logging.DEBUG,
+            f"Context update: {key} = {value}",
+            component=self.component,
+            operation=self.operation_name,
+            extra_data={key: value}
+        )
+
+# Enhanced logging functions
+def log_database_operation(operation: str, query: str, params=None, affected_rows=None,
+                          duration=None, success=True, error=None):
+    """Log database operations with full context"""
+    extra_data = {
+        'query': query[:200] + '...' if len(query) > 200 else query,  # Truncate long queries
+        'param_count': len(params) if params else 0,
+        'affected_rows': affected_rows,
+        'duration_ms': duration * 1000 if duration else None,
+        'success': success
+    }
+
+    if error:
+        extra_data['error'] = str(error)
+
+    level = logging.INFO if success else logging.ERROR
+    message = f"Database {operation}: {'SUCCESS' if success else 'FAILED'}"
+
+    audit_logger.log_with_context(
+        sql_logger, level, message,
+        component='SQL', operation=operation,
+        extra_data=extra_data,
+        exc_info=error if not success else None
+    )
+
+def log_ipfs_operation(token_id: str, operation: str, ipfs_path: str = None,
+                      data_size=None, duration=None, success=True, error=None):
+    """Log IPFS operations with full context"""
+    extra_data = {
+        'token_id': token_id,
+        'ipfs_path': ipfs_path,
+        'data_size_bytes': data_size,
+        'duration_ms': duration * 1000 if duration else None,
+        'success': success
+    }
+
+    if error:
+        extra_data['error'] = str(error)
+
+    level = logging.INFO if success else logging.WARNING
+    message = f"IPFS {operation} for token {token_id}: {'SUCCESS' if success else 'FAILED'}"
+
+    audit_logger.log_with_context(
+        ipfs_logger, level, message,
+        component='IPFS', operation=operation,
+        extra_data=extra_data
+    )
+
+def log_validation_result(token_id: str, validation_type: str, is_valid: bool,
+                         errors: List[str] = None, warnings: List[str] = None):
+    """Log validation results with detailed context"""
+    extra_data = {
+        'token_id': token_id,
+        'validation_type': validation_type,
+        'is_valid': is_valid,
+        'error_count': len(errors) if errors else 0,
+        'warning_count': len(warnings) if warnings else 0,
+        'errors': errors,
+        'warnings': warnings
+    }
+
+    level = logging.INFO if is_valid else logging.WARNING
+    message = f"Validation {validation_type} for token {token_id}: {'PASSED' if is_valid else 'FAILED'}"
+
+    audit_logger.log_with_context(
+        validation_logger, level, message,
+        component='VALIDATION', operation=validation_type,
+        extra_data=extra_data
+    )
+
+def log_sync_progress(database_name: str, progress_data: Dict[str, Any]):
+    """Log sync progress with comprehensive metrics"""
+    audit_logger.log_with_context(
+        sync_logger, logging.INFO,
+        f"Sync progress for {database_name}",
+        component='SYNC', operation='PROGRESS_UPDATE',
+        extra_data=progress_data
+    )
+
+def log_performance_metrics(operation: str, metrics: Dict[str, Any]):
+    """Log performance metrics for analysis"""
+    audit_logger.log_with_context(
+        logger, logging.INFO,
+        f"Performance metrics for {operation}",
+        component='PERFORMANCE', operation=operation,
+        extra_data=metrics
+    )
+
+@dataclass
+class SyncMetrics:
+    """Thread-safe metrics tracking for sync operations"""
+    total_databases_found: int = 0
+    total_databases_processed: int = 0
+    total_records_processed: int = 0
+    total_ipfs_success: int = 0
+    total_ipfs_failures: int = 0
+    total_sql_inserts: int = 0
+    total_sql_errors: int = 0
+    total_validation_errors: int = 0
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    errors: List[Dict[str, Any]] = None
+
+    def __post_init__(self):
+        if self.errors is None:
+            self.errors = []
+        if self.start_time is None:
+            self.start_time = datetime.now(timezone.utc)
+
+    def add_error(self, error_type: str, message: str, context: Dict[str, Any] = None):
+        """Thread-safe error logging with Telegram notification"""
+        with log_lock:
+            if len(self.errors) < MAX_ERROR_LOG_SIZE:
+                self.errors.append({
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'type': error_type,
+                    'message': message,
+                    'context': context or {}
+                })
+
+            # Send Telegram notification for critical errors
+            if TELEGRAM_AVAILABLE and error_type in ['database', 'system', 'connection']:
+                try:
+                    notify_error(error_type, message, context)
+                except Exception as e:
+                    # Don't let Telegram errors break the sync
+                    print(f"Failed to send Telegram error notification: {e}")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert metrics to dictionary for JSON serialization"""
+        duration = None
+        if self.end_time and self.start_time:
+            duration = (self.end_time - self.start_time).total_seconds()
+
+        return {
+            **asdict(self),
+            'duration_seconds': duration,
+            'records_per_second': self.total_records_processed / max(duration or 1, 1),
+            'ipfs_success_rate': self.total_ipfs_success / max(self.total_records_processed, 1) * 100,
+            'sql_success_rate': (self.total_records_processed - self.total_sql_errors) / max(self.total_records_processed, 1) * 100,
+            'total_errors': len(self.errors)
+        }
+
+@dataclass
+class TokenRecord:
+    """Structured token record for validation and processing"""
+    source_ip: str
+    node_name: str
+    did: Optional[str]
+    token_id: Optional[str]
+    created_at: Optional[datetime]
+    updated_at: Optional[datetime]
+    token_status: Optional[str]
+    parent_token_id: Optional[str]
+    token_value: Optional[str]
+    ipfs_data: Optional[str]
+    ipfs_fetched: bool
+    ipfs_error: Optional[str]
+    db_path: str
+    ipfs_path: Optional[str]
+    db_last_modified: datetime
+    validation_errors: List[str] = None
+
+    def __post_init__(self):
+        if self.validation_errors is None:
+            self.validation_errors = []
+
+    def validate(self) -> bool:
+        """Validate token record and log issues with detailed audit trail"""
+        is_valid = True
+        validation_warnings = []
+
+        # Token ID validation
+        if VALIDATE_TOKEN_FORMAT:
+            if not self.token_id or len(self.token_id.strip()) == 0:
+                self.validation_errors.append("Missing or empty token_id")
+                is_valid = False
+            elif len(self.token_id) > 500:  # Token ID length limit
+                self.validation_errors.append("Token ID exceeds maximum length (500)")
+                is_valid = False
+
+            # DID validation
+            if self.did:
+                if len(self.did) > 1000:  # Reasonable DID length limit
+                    self.validation_errors.append("DID exceeds maximum length (1000)")
+                    is_valid = False
+                elif len(self.did) < 10:  # Minimum DID length warning
+                    validation_warnings.append("DID is unusually short")
+
+            # Token status validation
+            if self.token_status and self.token_status not in ['ACTIVE', 'INACTIVE', 'PENDING', 'REVOKED']:
+                validation_warnings.append(f"Unknown token status: {self.token_status}")
+
+        # IPFS data validation
+        if VALIDATE_IPFS_DATA and self.ipfs_fetched and self.ipfs_data:
+            if len(self.ipfs_data) > 50000:  # 50KB limit for IPFS data
+                self.validation_errors.append("IPFS data exceeds size limit (50KB)")
+                is_valid = False
+            elif len(self.ipfs_data) < 10:  # Minimum data size warning
+                validation_warnings.append("IPFS data is unusually small")
+
+        # Database path validation
+        if not self.db_path or not os.path.exists(self.db_path):
+            self.validation_errors.append("Invalid or missing database path")
+            is_valid = False
+
+        # Log validation results
+        log_validation_result(
+            self.token_id or 'UNKNOWN',
+            'RECORD_VALIDATION',
+            is_valid,
+            errors=self.validation_errors,
+            warnings=validation_warnings
+        )
+
+        return is_valid
+
+# Global metrics instance
+sync_metrics = SyncMetrics()
+
+# Cache for public IP
+_cached_public_ip = None
+
+# Connection pool management
+class AzureSQLConnectionPool:
+    """Thread-safe connection pool for Azure SQL Database"""
+
+    def __init__(self, connection_string: str, pool_size: int = CONNECTION_POOL_SIZE):
+        self.connection_string = connection_string
+        self.pool_size = pool_size
+        self.pool = []
+        self.pool_lock = threading.Lock()
+        self.active_connections = 0
+
+    def get_connection(self):
+        """Get a connection from the pool or create a new one"""
+        with self.pool_lock:
+            if self.pool:
+                return self.pool.pop()
+            elif self.active_connections < self.pool_size:
+                self.active_connections += 1
+                return pyodbc.connect(self.connection_string)
+            else:
+                # Pool exhausted, wait and retry
+                time.sleep(0.1)
+                return self.get_connection()
+
+    def return_connection(self, conn):
+        """Return a connection to the pool"""
+        with self.pool_lock:
+            if len(self.pool) < self.pool_size:
+                self.pool.append(conn)
+            else:
+                conn.close()
+                self.active_connections -= 1
+
+    def close_all(self):
+        """Close all connections in the pool"""
+        with self.pool_lock:
+            for conn in self.pool:
+                try:
+                    conn.close()
+                except:
+                    pass
+            self.pool.clear()
+            self.active_connections = 0
+
+# Global connection pool
+connection_pool = None
+
+
+def get_azure_sql_connection_string() -> str:
+    """Get Azure SQL Database connection string from config file if available."""
+    global AZURE_SQL_CONNECTION_STRING
+
+    if os.path.exists(CONNECTION_CONFIG_FILE):
+        try:
+            with open(CONNECTION_CONFIG_FILE, 'r') as f:
+                content = f.read().strip()
+                if content and 'Server=tcp:' in content:
+                    logger.info("Loaded Azure SQL connection string from config file")
+                    return content
+        except Exception as e:
+            logger.warning(f"Could not read Azure SQL connection file: {e}")
+            sync_metrics.add_error("connection", f"Failed to read config file: {e}")
+
+    # Validate that password is set
+    if "{your_password}" in AZURE_SQL_CONNECTION_STRING:
+        logger.error("Password placeholder found in connection string. Please update the password.")
+        raise ValueError("Azure SQL Database password not configured")
+
+    return AZURE_SQL_CONNECTION_STRING
+
+def init_connection_pool() -> AzureSQLConnectionPool:
+    """Initialize the global connection pool"""
+    global connection_pool
+    if connection_pool is None:
+        conn_string = get_azure_sql_connection_string()
+        connection_pool = AzureSQLConnectionPool(conn_string)
+        logger.info(f"Initialized Azure SQL connection pool with {CONNECTION_POOL_SIZE} connections")
+    return connection_pool
+
+
+def get_public_ip() -> str:
+    """Get the public IP address of the current VM."""
+    global _cached_public_ip
+
+    if _cached_public_ip:
+        return _cached_public_ip
+
+    services = [
+        'https://api.ipify.org?format=text',
+        'https://ifconfig.me/ip',
+        'https://icanhazip.com',
+        'http://wtfismyip.com/text'
+    ]
+
+    for service in services:
+        try:
+            response = requests.get(service, timeout=5)
+            if response.status_code == 200:
+                ip = response.text.strip()
+                _cached_public_ip = ip
+                logger.info(f"Detected public IP: {ip}")
+
+                # Update Telegram notifier with machine info
+                if TELEGRAM_AVAILABLE:
+                    import socket
+                    hostname = socket.gethostname()
+                    update_machine_info(ip, hostname)
+
+                return ip
+        except Exception as e:
+            logger.warning(f"Failed to get IP from {service}: {e}")
+            continue
+
+    logger.warning("Could not detect public IP, using 'unknown'")
+    _cached_public_ip = 'unknown'
+    return _cached_public_ip
+
+def initialize_telegram_notifications():
+    """Initialize Telegram notifications if configured"""
+    if not TELEGRAM_AVAILABLE:
+        return False
+
+    try:
+        # Try to initialize with existing config
+        notifier = init_telegram_notifier()
+
+        if notifier and notifier.config.enabled and notifier.config.bot_token:
+            # Test connection
+            if notifier.test_connection():
+                audit_logger.log_with_context(
+                    logger, logging.INFO, "Telegram notifications initialized successfully",
+                    component='TELEGRAM', operation='INITIALIZATION',
+                    extra_data={
+                        'machine_id': notifier.machine_id,
+                        'chat_id': notifier.config.chat_id[:10] + "..." if notifier.config.chat_id else "N/A"
+                    }
+                )
+                return True
+            else:
+                logger.warning("Telegram connection test failed")
+                return False
+        else:
+            logger.info("Telegram notifications not configured or disabled")
+            return False
+
+    except Exception as e:
+        logger.warning(f"Failed to initialize Telegram notifications: {e}")
+        return False
+
+
+def safe_str(value) -> Optional[str]:
+    """Safely convert value to string, handling None and empty strings."""
+    if value is None or value == '':
+        return None
+    return str(value).strip() if str(value).strip() else None
+
+
+def safe_timestamp(value) -> Optional[datetime]:
+    """Safely convert value to datetime, handling various formats and None."""
+    if value is None or value == '':
+        return None
+
+    if isinstance(value, datetime):
+        return value
+
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value)
+        except:
+            return None
+
+    if isinstance(value, str):
+        # Try various datetime formats
+        formats = [
+            '%Y-%m-%d %H:%M:%S',
+            '%Y-%m-%dT%H:%M:%S',
+            '%Y-%m-%d %H:%M:%S.%f',
+            '%Y-%m-%dT%H:%M:%S.%f',
+        ]
+
+        # Remove timezone indicators
+        value = value.replace('Z', '').replace('+00:00', '')
+
+        for fmt in formats:
+            try:
+                return datetime.strptime(value, fmt)
+            except:
+                continue
+
+    return None
+
+
+def find_rubix_databases(start_path: str = '.') -> List[Tuple[str, float]]:
+    """
+    Recursively search for Rubix/rubix.db files.
+    Returns list of tuples: (db_path, last_modified_timestamp)
+    """
+    logger.info(f"Scanning for rubix.db files from: {os.path.abspath(start_path)}")
+
+    databases = []
+    start_path = Path(start_path).resolve()
+
+    for rubix_db in start_path.rglob('Rubix/rubix.db'):
+        if rubix_db.is_file():
+            db_path = str(rubix_db)
+            last_modified = rubix_db.stat().st_mtime
+            databases.append((db_path, last_modified))
+            logger.info(f"Found database: {db_path}")
+
+    logger.info(f"Total databases found: {len(databases)}")
+    return databases
+
+
+def find_ipfs_directory(db_path: str) -> Optional[str]:
+    """
+    Find .ipfs directory for a given rubix.db path.
+    Looks in parent directories and siblings.
+
+    For example: /mnt/drived/node032/Rubix/rubix.db
+    Should find: /mnt/drived/node032/.ipfs
+    """
+    db_path_obj = Path(db_path)
+
+    # Start from parent of Rubix directory (e.g., node032)
+    node_dir = db_path_obj.parent.parent
+
+    # Check for .ipfs in node directory
+    ipfs_path = node_dir / '.ipfs'
+    if ipfs_path.exists() and ipfs_path.is_dir():
+        logger.debug(f"Found IPFS dir: {ipfs_path}")
+        return str(ipfs_path)
+
+    # Check parent directory
+    ipfs_path = node_dir.parent / '.ipfs'
+    if ipfs_path.exists() and ipfs_path.is_dir():
+        logger.debug(f"Found IPFS dir: {ipfs_path}")
+        return str(ipfs_path)
+
+    logger.warning(f"No .ipfs directory found for {db_path}")
+    return None
+
+
+def extract_node_name(db_path: str) -> str:
+    """
+    Extract node name from database path.
+    E.g., /mnt/drived/node032/Rubix/rubix.db -> node032
+    """
+    db_path_obj = Path(db_path)
+    node_dir = db_path_obj.parent.parent
+    return node_dir.name
+
+
+def fetch_ipfs_data(token_id: str, ipfs_path: str, script_dir: str) -> Tuple[Optional[str], bool, Optional[str]]:
+    """
+    Fetch IPFS data for a token_id using ipfs cat with detailed logging.
+
+    Returns:
+        (ipfs_data, success, error_message)
+    """
+    if not token_id or token_id.strip() == '':
+        log_ipfs_operation(token_id, 'FETCH', ipfs_path, success=False, error="Empty token_id")
+        return (None, False, "Empty token_id")
+
+    operation_start = time.time()
+
+    with OperationContext(f"IPFS_FETCH_{token_id[:8]}", 'IPFS', ipfs_logger, log_start=False, log_end=False):
+        try:
+            # Set IPFS_PATH environment variable
+            env = os.environ.copy()
+            env['IPFS_PATH'] = ipfs_path
+
+            # Log the attempt
+            audit_logger.log_with_context(
+                ipfs_logger, logging.DEBUG,
+                f"Attempting IPFS fetch for token {token_id}",
+                component='IPFS', operation='FETCH',
+                extra_data={
+                    'token_id': token_id,
+                    'ipfs_path': ipfs_path,
+                    'script_dir': script_dir,
+                    'timeout': IPFS_TIMEOUT
+                }
+            )
+
+            # Run ipfs cat command
+            ipfs_cmd = os.path.join(script_dir, 'ipfs')
+            result = subprocess.run(
+                [ipfs_cmd, 'cat', token_id],
+                capture_output=True,
+                text=True,
+                timeout=IPFS_TIMEOUT,
+                env=env,
+                cwd=script_dir
+            )
+
+            duration = time.time() - operation_start
+
+            if result.returncode == 0:
+                ipfs_data = result.stdout.strip()
+                data_size = len(ipfs_data) if ipfs_data else 0
+
+                log_ipfs_operation(
+                    token_id, 'FETCH', ipfs_path,
+                    data_size=data_size, duration=duration, success=True
+                )
+
+                return (ipfs_data if ipfs_data else None, True, None)
+            else:
+                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                limited_error = error_msg[:500]  # Limit error message length
+
+                log_ipfs_operation(
+                    token_id, 'FETCH', ipfs_path,
+                    duration=duration, success=False, error=limited_error
+                )
+
+                return (None, False, limited_error)
+
+        except subprocess.TimeoutExpired:
+            duration = time.time() - operation_start
+            error_msg = f"IPFS timeout after {IPFS_TIMEOUT}s"
+
+            log_ipfs_operation(
+                token_id, 'FETCH', ipfs_path,
+                duration=duration, success=False, error=error_msg
+            )
+
+            return (None, False, "IPFS timeout")
+
+        except Exception as e:
+            duration = time.time() - operation_start
+            error_msg = str(e)[:500]
+
+            log_ipfs_operation(
+                token_id, 'FETCH', ipfs_path,
+                duration=duration, success=False, error=error_msg
+            )
+
+            # Log full exception details
+            audit_logger.log_with_context(
+                ipfs_logger, logging.ERROR,
+                f"Unexpected error fetching IPFS data for token {token_id}",
+                component='IPFS', operation='FETCH',
+                extra_data={
+                    'token_id': token_id,
+                    'error': error_msg,
+                    'exception_type': type(e).__name__
+                },
+                exc_info=True
+            )
+
+            return (None, False, error_msg)
+
+
+def process_token_ipfs(args: Tuple) -> TokenRecord:
+    """
+    Process a single token: fetch IPFS data and prepare record.
+    This function is designed for parallel execution.
+    """
+    (token_row, source_ip, node_name, db_path, ipfs_path, db_last_modified, script_dir) = args
+
+    # Extract SQLite fields with safe handling
+    did = safe_str(token_row[0])
+    token_id = safe_str(token_row[1])
+    created_at = safe_timestamp(token_row[2])
+    updated_at = safe_timestamp(token_row[3])
+    token_status = safe_str(token_row[4])
+    parent_token_id = safe_str(token_row[5])
+    token_value = safe_str(token_row[6])
+
+    # Fetch IPFS data if token_id exists
+    ipfs_data = None
+    ipfs_fetched = False
+    ipfs_error = None
+
+    if token_id and ipfs_path:
+        for attempt in range(RETRY_ATTEMPTS):
+            ipfs_data, ipfs_fetched, ipfs_error = fetch_ipfs_data(token_id, ipfs_path, script_dir)
+            if ipfs_fetched or ipfs_error != "IPFS timeout":
+                break
+            time.sleep(0.1 * (attempt + 1))  # Brief exponential backoff
+    elif not ipfs_path:
+        ipfs_error = "No IPFS path found"
+
+    # Create and validate record
+    db_modified_dt = datetime.fromtimestamp(db_last_modified)
+
+    record = TokenRecord(
+        source_ip=source_ip,
+        node_name=node_name,
+        did=did,
+        token_id=token_id,
+        created_at=created_at,
+        updated_at=updated_at,
+        token_status=token_status,
+        parent_token_id=parent_token_id,
+        token_value=token_value,
+        ipfs_data=ipfs_data,
+        ipfs_fetched=ipfs_fetched,
+        ipfs_error=ipfs_error,
+        db_path=db_path,
+        ipfs_path=ipfs_path,
+        db_last_modified=db_modified_dt
+    )
+
+    # Validate the record
+    if not record.validate():
+        sync_metrics.total_validation_errors += 1
+
+    return record
+
+
+def create_azure_sql_tables():
+    """Create TokenRecords and ProcessedDatabases tables in Azure SQL Database with optimized schema."""
+    pool = init_connection_pool()
+    conn = pool.get_connection()
+
+    try:
+        cursor = conn.cursor()
+
+        # Create TokenRecords table with Azure SQL optimized schema
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[TokenRecords]') AND type in (N'U'))
+            BEGIN
+                CREATE TABLE [dbo].[TokenRecords] (
+                    [id] BIGINT IDENTITY(1,1) PRIMARY KEY,
+                    [source_ip] NVARCHAR(45) NOT NULL,
+                    [node_name] NVARCHAR(255) NOT NULL,
+                    [did] NVARCHAR(1000) NULL,
+                    [token_id] NVARCHAR(500) NULL,
+                    [created_at] DATETIME2(7) NULL,
+                    [updated_at] DATETIME2(7) NULL,
+                    [token_status] NVARCHAR(50) NULL,
+                    [parent_token_id] NVARCHAR(500) NULL,
+                    [token_value] NVARCHAR(MAX) NULL,
+                    [ipfs_data] NVARCHAR(MAX) NULL,
+                    [ipfs_fetched] BIT DEFAULT 0,
+                    [ipfs_error] NVARCHAR(1000) NULL,
+                    [db_path] NVARCHAR(500) NOT NULL,
+                    [ipfs_path] NVARCHAR(500) NULL,
+                    [db_last_modified] DATETIME2(7) NOT NULL,
+                    [synced_at] DATETIME2(7) DEFAULT GETUTCDATE(),
+                    [validation_errors] NVARCHAR(MAX) NULL
+                )
+            END
+        """)
+
+        # Create optimized indexes for Azure SQL Database
+        indexes = [
+            "IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='IX_TokenRecords_token_id') CREATE INDEX IX_TokenRecords_token_id ON [dbo].[TokenRecords] ([token_id]) INCLUDE ([did], [ipfs_fetched])",
+            "IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='IX_TokenRecords_did') CREATE INDEX IX_TokenRecords_did ON [dbo].[TokenRecords] ([did]) INCLUDE ([token_id], [node_name])",
+            "IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='IX_TokenRecords_node_name') CREATE INDEX IX_TokenRecords_node_name ON [dbo].[TokenRecords] ([node_name]) INCLUDE ([source_ip], [synced_at])",
+            "IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='IX_TokenRecords_source_ip') CREATE INDEX IX_TokenRecords_source_ip ON [dbo].[TokenRecords] ([source_ip])",
+            "IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='IX_TokenRecords_db_path') CREATE INDEX IX_TokenRecords_db_path ON [dbo].[TokenRecords] ([db_path])",
+            "IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='IX_TokenRecords_ipfs_fetched') CREATE INDEX IX_TokenRecords_ipfs_fetched ON [dbo].[TokenRecords] ([ipfs_fetched]) INCLUDE ([ipfs_error])",
+            "IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='IX_TokenRecords_synced_at') CREATE INDEX IX_TokenRecords_synced_at ON [dbo].[TokenRecords] ([synced_at]) INCLUDE ([node_name], [source_ip])"
+        ]
+
+        for index_sql in indexes:
+            cursor.execute(index_sql)
+
+        # Create ProcessedDatabases metadata table
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[ProcessedDatabases]') AND type in (N'U'))
+            BEGIN
+                CREATE TABLE [dbo].[ProcessedDatabases] (
+                    [db_path] NVARCHAR(500) PRIMARY KEY,
+                    [last_modified] DATETIME2(7) NOT NULL,
+                    [last_processed] DATETIME2(7) NOT NULL,
+                    [record_count] INT DEFAULT 0,
+                    [ipfs_success_count] INT DEFAULT 0,
+                    [ipfs_fail_count] INT DEFAULT 0,
+                    [validation_error_count] INT DEFAULT 0,
+                    [processing_duration_seconds] FLOAT DEFAULT 0
+                )
+            END
+        """)
+
+        # Create SyncSessions table for tracking sync runs
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[SyncSessions]') AND type in (N'U'))
+            BEGIN
+                CREATE TABLE [dbo].[SyncSessions] (
+                    [session_id] UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+                    [start_time] DATETIME2(7) DEFAULT GETUTCDATE(),
+                    [end_time] DATETIME2(7) NULL,
+                    [source_ip] NVARCHAR(45) NOT NULL,
+                    [total_databases_found] INT DEFAULT 0,
+                    [total_databases_processed] INT DEFAULT 0,
+                    [total_records_processed] INT DEFAULT 0,
+                    [total_ipfs_success] INT DEFAULT 0,
+                    [total_ipfs_failures] INT DEFAULT 0,
+                    [total_sql_inserts] INT DEFAULT 0,
+                    [total_sql_errors] INT DEFAULT 0,
+                    [total_validation_errors] INT DEFAULT 0,
+                    [status] NVARCHAR(20) DEFAULT 'RUNNING',
+                    [error_summary] NVARCHAR(MAX) NULL
+                )
+            END
+        """)
+
+        conn.commit()
+        cursor.close()
+        logger.info("Azure SQL Database tables and indexes created successfully")
+
+    except Exception as e:
+        logger.error(f"Error creating Azure SQL tables: {e}")
+        sync_metrics.add_error("database", f"Failed to create tables: {e}")
+        raise
+    finally:
+        pool.return_connection(conn)
+
+
+def get_processed_databases() -> Dict[str, float]:
+    """Get dictionary of already processed databases and their last_modified timestamps."""
+    pool = init_connection_pool()
+    conn = pool.get_connection()
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT [db_path], DATEDIFF(SECOND, '1970-01-01', [last_modified])
+            FROM [dbo].[ProcessedDatabases]
+        """)
+
+        processed = {row[0]: float(row[1]) for row in cursor.fetchall()}
+        cursor.close()
+        return processed
+
+    except Exception as e:
+        logger.error(f"Error getting processed databases: {e}")
+        sync_metrics.add_error("database", f"Failed to get processed databases: {e}")
+        return {}
+    finally:
+        pool.return_connection(conn)
+
+
+def needs_processing(db_path: str, db_last_modified: float, processed_dbs: Dict[str, float]) -> bool:
+    """Check if a database needs to be processed based on last_modified timestamp."""
+    if db_path not in processed_dbs:
+        return True
+    return db_last_modified > processed_dbs[db_path]
+
+
+def process_database(db_path: str, db_last_modified: float, source_ip: str, script_dir: str) -> List[Tuple]:
+    """
+    Process a single database: read tokens from SQLite and fetch IPFS data.
+    Returns list of records ready for PostgreSQL insertion.
+    """
+    try:
+        # Extract node name and find IPFS directory
+        node_name = extract_node_name(db_path)
+        ipfs_path = find_ipfs_directory(db_path)
+
+        logger.info(f"Processing {node_name}: {db_path}")
+        if ipfs_path:
+            logger.info(f"  IPFS path: {ipfs_path}")
+        else:
+            logger.warning(f"  No IPFS path found for {node_name}")
+
+        # Connect to SQLite database
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Check if TokensTable exists
+        cursor.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='TokensTable'
+        """)
+
+        if not cursor.fetchone():
+            logger.warning(f"TokensTable not found in {db_path}")
+            conn.close()
+            return []
+
+        # Read all tokens
+        cursor.execute("""
+            SELECT did, token_id, created_at, updated_at,
+                   token_status, parent_token_id, token_value
+            FROM TokensTable
+        """)
+
+        token_rows = cursor.fetchall()
+        conn.close()
+
+        logger.info(f"  Found {len(token_rows)} tokens in {node_name}")
+
+        if not token_rows:
+            return []
+
+        # Prepare arguments for parallel processing
+        args_list = [
+            (row, source_ip, node_name, db_path, ipfs_path, db_last_modified, script_dir)
+            for row in token_rows
+        ]
+
+        # Process tokens in parallel (IPFS calls)
+        logger.info(f"  Fetching IPFS data for {len(token_rows)} tokens using {NUM_IPFS_WORKERS} workers...")
+
+        with Pool(processes=NUM_IPFS_WORKERS) as pool:
+            records = pool.map(process_token_ipfs, args_list)
+
+        # Count IPFS successes and failures
+        ipfs_success = sum(1 for r in records if r.ipfs_fetched)
+        ipfs_fail = len(records) - ipfs_success
+        validation_errors = sum(1 for r in records if r.validation_errors)
+
+        logger.info(f"  IPFS fetch: {ipfs_success} succeeded, {ipfs_fail} failed")
+        if validation_errors > 0:
+            logger.warning(f"  Validation errors: {validation_errors}")
+
+        return records
+
+    except sqlite3.Error as e:
+        logger.error(f"SQLite error reading {db_path}: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"Unexpected error processing {db_path}: {e}")
+        return []
+
+
+def bulk_insert_records(records: List[TokenRecord]) -> Tuple[int, int]:
+    """
+    Optimized bulk insert for Azure SQL Database with comprehensive transaction logging.
+    Returns tuple of (success_count, error_count)
+    """
+    if not records:
+        return 0, 0
+
+    operation_start = time.time()
+
+    with OperationContext(f"BULK_INSERT_{len(records)}_RECORDS", 'SQL', sql_logger):
+        pool = init_connection_pool()
+        conn = pool.get_connection()
+        success_count = 0
+        error_count = 0
+
+        try:
+            # Log operation start
+            audit_logger.log_with_context(
+                sql_logger, logging.INFO,
+                f"Starting bulk insert for {len(records)} records",
+                component='SQL', operation='BULK_INSERT',
+                extra_data={
+                    'record_count': len(records),
+                    'batch_threshold': BULK_INSERT_SIZE,
+                    'connection_pool_size': CONNECTION_POOL_SIZE
+                }
+            )
+
+            # Convert records to DataFrame for bulk operations
+            data = []
+            validation_error_count = 0
+            ipfs_success_count = 0
+
+            for record in records:
+                validation_errors_json = json.dumps(record.validation_errors) if record.validation_errors else None
+                if record.validation_errors:
+                    validation_error_count += 1
+                if record.ipfs_fetched:
+                    ipfs_success_count += 1
+
+                data.append([
+                    record.source_ip,
+                    record.node_name,
+                    record.did,
+                    record.token_id,
+                    record.created_at,
+                    record.updated_at,
+                    record.token_status,
+                    record.parent_token_id,
+                    record.token_value,
+                    record.ipfs_data,
+                    record.ipfs_fetched,
+                    record.ipfs_error,
+                    record.db_path,
+                    record.ipfs_path,
+                    record.db_last_modified,
+                    validation_errors_json
+                ])
+
+            # Log data preparation metrics
+            prep_time = time.time() - operation_start
+            audit_logger.log_with_context(
+                sql_logger, logging.DEBUG,
+                "Data preparation completed",
+                component='SQL', operation='BULK_INSERT',
+                extra_data={
+                    'preparation_time_ms': prep_time * 1000,
+                    'validation_errors': validation_error_count,
+                    'ipfs_success': ipfs_success_count,
+                    'data_rows': len(data)
+                }
+            )
+
+            # Use parameterized query with fast_executemany for optimal performance
+            cursor = conn.cursor()
+            cursor.fast_executemany = True
+
+            insert_query = """
+                INSERT INTO [dbo].[TokenRecords]
+                ([source_ip], [node_name], [did], [token_id], [created_at], [updated_at],
+                 [token_status], [parent_token_id], [token_value], [ipfs_data], [ipfs_fetched],
+                 [ipfs_error], [db_path], [ipfs_path], [db_last_modified], [validation_errors])
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+
+            execute_start = time.time()
+            cursor.executemany(insert_query, data)
+            execute_time = time.time() - execute_start
+
+            commit_start = time.time()
+            conn.commit()
+            commit_time = time.time() - commit_start
+
+            success_count = len(records)
+
+            # Update metrics
+            sync_metrics.total_sql_inserts += success_count
+
+            # Log successful operation
+            total_duration = time.time() - operation_start
+            log_database_operation(
+                'BULK_INSERT',
+                insert_query,
+                params=data,
+                affected_rows=success_count,
+                duration=total_duration,
+                success=True
+            )
+
+            # Log performance metrics
+            audit_logger.log_with_context(
+                sql_logger, logging.INFO,
+                f"Bulk insert completed successfully: {success_count} records",
+                component='SQL', operation='BULK_INSERT',
+                extra_data={
+                    'total_duration_ms': total_duration * 1000,
+                    'execute_time_ms': execute_time * 1000,
+                    'commit_time_ms': commit_time * 1000,
+                    'records_per_second': success_count / total_duration,
+                    'validation_errors': validation_error_count,
+                    'ipfs_success_rate': (ipfs_success_count / len(records)) * 100
+                }
+            )
+
+        except Exception as e:
+            error_duration = time.time() - operation_start
+            error_msg = str(e)
+
+            # Log the error with full context
+            log_database_operation(
+                'BULK_INSERT',
+                insert_query if 'insert_query' in locals() else 'N/A',
+                params=[],
+                affected_rows=0,
+                duration=error_duration,
+                success=False,
+                error=e
+            )
+
+            sync_metrics.add_error("database", f"Bulk insert failed: {error_msg}", {
+                "record_count": len(records),
+                "error_type": type(e).__name__,
+                "duration_ms": error_duration * 1000
+            })
+            sync_metrics.total_sql_errors += len(records)
+            error_count = len(records)
+
+            try:
+                conn.rollback()
+                audit_logger.log_with_context(
+                    sql_logger, logging.INFO,
+                    "Transaction rolled back successfully",
+                    component='SQL', operation='ROLLBACK'
+                )
+            except Exception as rollback_error:
+                audit_logger.log_with_context(
+                    sql_logger, logging.ERROR,
+                    f"Rollback failed: {rollback_error}",
+                    component='SQL', operation='ROLLBACK',
+                    exc_info=True
+                )
+
+            # Try individual inserts as fallback
+            audit_logger.log_with_context(
+                sql_logger, logging.WARNING,
+                "Attempting fallback to individual inserts",
+                component='SQL', operation='FALLBACK_INSERT'
+            )
+            success_count, error_count = fallback_individual_inserts(records)
+
+        finally:
+            pool.return_connection(conn)
+
+    return success_count, error_count
+
+def fallback_individual_inserts(records: List[TokenRecord]) -> Tuple[int, int]:
+    """Fallback to individual inserts when bulk insert fails"""
+    pool = init_connection_pool()
+    success_count = 0
+    error_count = 0
+
+    insert_query = """
+        INSERT INTO [dbo].[TokenRecords]
+        ([source_ip], [node_name], [did], [token_id], [created_at], [updated_at],
+         [token_status], [parent_token_id], [token_value], [ipfs_data], [ipfs_fetched],
+         [ipfs_error], [db_path], [ipfs_path], [db_last_modified], [validation_errors])
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    for record in records:
+        conn = pool.get_connection()
+        try:
+            cursor = conn.cursor()
+            validation_errors_json = json.dumps(record.validation_errors) if record.validation_errors else None
+
+            cursor.execute(insert_query, [
+                record.source_ip, record.node_name, record.did, record.token_id,
+                record.created_at, record.updated_at, record.token_status,
+                record.parent_token_id, record.token_value, record.ipfs_data,
+                record.ipfs_fetched, record.ipfs_error, record.db_path,
+                record.ipfs_path, record.db_last_modified, validation_errors_json
+            ])
+
+            conn.commit()
+            success_count += 1
+
+        except Exception as e:
+            error_count += 1
+            sync_metrics.add_error("database", f"Individual insert failed: {e}",
+                                 {"token_id": record.token_id, "node_name": record.node_name})
+            try:
+                conn.rollback()
+            except:
+                pass
+
+        finally:
+            pool.return_connection(conn)
+
+    logger.info(f"  Fallback inserts: {success_count} succeeded, {error_count} failed")
+    return success_count, error_count
+
+
+def update_processed_database(db_path: str, db_last_modified: float, record_count: int,
+                               ipfs_success: int, ipfs_fail: int, validation_errors: int = 0,
+                               processing_duration: float = 0):
+    """Update the ProcessedDatabases table with processing metadata."""
+    pool = init_connection_pool()
+    conn = pool.get_connection()
+
+    try:
+        cursor = conn.cursor()
+        db_modified_dt = datetime.fromtimestamp(db_last_modified)
+
+        # Use MERGE for upsert operation in Azure SQL Database
+        cursor.execute("""
+            MERGE [dbo].[ProcessedDatabases] AS target
+            USING (VALUES (?, ?, GETUTCDATE(), ?, ?, ?, ?, ?)) AS source
+                ([db_path], [last_modified], [last_processed], [record_count],
+                 [ipfs_success_count], [ipfs_fail_count], [validation_error_count], [processing_duration_seconds])
+            ON target.[db_path] = source.[db_path]
+            WHEN MATCHED THEN
+                UPDATE SET
+                    [last_modified] = source.[last_modified],
+                    [last_processed] = source.[last_processed],
+                    [record_count] = source.[record_count],
+                    [ipfs_success_count] = source.[ipfs_success_count],
+                    [ipfs_fail_count] = source.[ipfs_fail_count],
+                    [validation_error_count] = source.[validation_error_count],
+                    [processing_duration_seconds] = source.[processing_duration_seconds]
+            WHEN NOT MATCHED THEN
+                INSERT ([db_path], [last_modified], [last_processed], [record_count],
+                       [ipfs_success_count], [ipfs_fail_count], [validation_error_count], [processing_duration_seconds])
+                VALUES (source.[db_path], source.[last_modified], source.[last_processed], source.[record_count],
+                       source.[ipfs_success_count], source.[ipfs_fail_count], source.[validation_error_count], source.[processing_duration_seconds]);
+        """, (db_path, db_modified_dt, record_count, ipfs_success, ipfs_fail, validation_errors, processing_duration))
+
+        conn.commit()
+        cursor.close()
+
+    except Exception as e:
+        logger.error(f"Error updating processed database metadata: {e}")
+        sync_metrics.add_error("database", f"Failed to update metadata: {e}", {"db_path": db_path})
+        try:
+            conn.rollback()
+        except:
+            pass
+    finally:
+        pool.return_connection(conn)
+
+def create_sync_session(source_ip: str) -> str:
+    """Create a new sync session and return session ID"""
+    pool = init_connection_pool()
+    conn = pool.get_connection()
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO [dbo].[SyncSessions] ([source_ip])
+            OUTPUT INSERTED.session_id
+            VALUES (?)
+        """, (source_ip,))
+
+        session_id = cursor.fetchone()[0]
+        conn.commit()
+        cursor.close()
+        return str(session_id)
+
+    except Exception as e:
+        logger.error(f"Error creating sync session: {e}")
+        sync_metrics.add_error("database", f"Failed to create sync session: {e}")
+        return str(datetime.now(timezone.utc).isoformat())
+    finally:
+        pool.return_connection(conn)
+
+def update_sync_session(session_id: str, metrics: SyncMetrics, status: str = "COMPLETED"):
+    """Update sync session with final metrics"""
+    pool = init_connection_pool()
+    conn = pool.get_connection()
+
+    try:
+        cursor = conn.cursor()
+        error_summary = json.dumps(metrics.errors[-10:]) if metrics.errors else None  # Last 10 errors
+
+        cursor.execute("""
+            UPDATE [dbo].[SyncSessions]
+            SET [end_time] = GETUTCDATE(),
+                [total_databases_found] = ?,
+                [total_databases_processed] = ?,
+                [total_records_processed] = ?,
+                [total_ipfs_success] = ?,
+                [total_ipfs_failures] = ?,
+                [total_sql_inserts] = ?,
+                [total_sql_errors] = ?,
+                [total_validation_errors] = ?,
+                [status] = ?,
+                [error_summary] = ?
+            WHERE [session_id] = ?
+        """, (metrics.total_databases_found, metrics.total_databases_processed,
+              metrics.total_records_processed, metrics.total_ipfs_success,
+              metrics.total_ipfs_failures, metrics.total_sql_inserts,
+              metrics.total_sql_errors, metrics.total_validation_errors,
+              status, error_summary, session_id))
+
+        conn.commit()
+        cursor.close()
+
+    except Exception as e:
+        logger.error(f"Error updating sync session: {e}")
+        sync_metrics.add_error("database", f"Failed to update sync session: {e}")
+    finally:
+        pool.return_connection(conn)
+
+
+def generate_final_report():
+    """Generate comprehensive final report with all metrics and recommendations"""
+    sync_metrics.end_time = datetime.now(timezone.utc)
+    metrics_dict = sync_metrics.to_dict()
+
+    # Write JSON report
+    report_file = f"sync_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    try:
+        with open(report_file, 'w') as f:
+            json.dump(metrics_dict, f, indent=2, default=str)
+        logger.info(f"Detailed report saved to: {report_file}")
+    except Exception as e:
+        logger.error(f"Failed to save report: {e}")
+
+    # Print executive summary
+    logger.info("=" * 80)
+    logger.info("EXECUTIVE SUMMARY")
+    logger.info("=" * 80)
+    logger.info(f"Sync Duration: {metrics_dict.get('duration_seconds', 0):.2f} seconds ({metrics_dict.get('duration_seconds', 0)/60:.1f} minutes)")
+    logger.info(f"Processing Rate: {metrics_dict.get('records_per_second', 0):.2f} records/second")
+    logger.info(f"Databases Found: {sync_metrics.total_databases_found:,}")
+    logger.info(f"Databases Processed: {sync_metrics.total_databases_processed:,}")
+    logger.info(f"Total Records: {sync_metrics.total_records_processed:,}")
+    logger.info(f"IPFS Success Rate: {metrics_dict.get('ipfs_success_rate', 0):.1f}%")
+    logger.info(f"SQL Success Rate: {metrics_dict.get('sql_success_rate', 0):.1f}%")
+    logger.info(f"Validation Errors: {sync_metrics.total_validation_errors:,}")
+
+    if sync_metrics.errors:
+        logger.warning(f"Total Errors: {len(sync_metrics.errors)}")
+        error_types = {}
+        for error in sync_metrics.errors[-10:]:  # Show last 10 errors
+            error_type = error.get('type', 'unknown')
+            error_types[error_type] = error_types.get(error_type, 0) + 1
+
+        logger.warning("Error breakdown (last 10):")
+        for error_type, count in error_types.items():
+            logger.warning(f"  {error_type}: {count}")
+
+    logger.info("=" * 80)
+
+def main():
+    """Main function to orchestrate the distributed token sync with Azure SQL Database."""
+    # Start main operation with correlation tracking
+    main_correlation_id = audit_logger.start_operation("MAIN_SYNC_OPERATION")
+
+    audit_logger.log_with_context(
+        logger, logging.INFO, "=" * 80,
+        component='MAIN', operation='STARTUP'
+    )
+    audit_logger.log_with_context(
+        logger, logging.INFO, "Starting Distributed Token Sync Service (Azure SQL Database + IPFS)",
+        component='MAIN', operation='STARTUP',
+        extra_data={
+            'version': '2.0',
+            'azure_sql_enabled': True,
+            'detailed_logging_enabled': True,
+            'correlation_id': main_correlation_id
+        }
+    )
+    audit_logger.log_with_context(
+        logger, logging.INFO, "=" * 80,
+        component='MAIN', operation='STARTUP'
+    )
+
+    session_id = None
+    global connection_pool
+
+    with OperationContext("DISTRIBUTED_TOKEN_SYNC", 'MAIN', logger):
+        try:
+            # Get script directory (where ipfs executable should be)
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            audit_logger.log_with_context(
+                logger, logging.INFO, f"Script directory: {script_dir}",
+                component='MAIN', operation='INITIALIZATION',
+                extra_data={'script_directory': script_dir}
+            )
+
+            # Verify IPFS executable exists
+            ipfs_exe = os.path.join(script_dir, 'ipfs')
+            if not os.path.exists(ipfs_exe):
+                audit_logger.log_with_context(
+                    logger, logging.WARNING, f"IPFS executable not found at {ipfs_exe}",
+                    component='MAIN', operation='IPFS_CHECK',
+                    extra_data={'ipfs_path': ipfs_exe, 'exists': False}
+                )
+                audit_logger.log_with_context(
+                    logger, logging.WARNING, "IPFS data will not be fetched",
+                    component='MAIN', operation='IPFS_CHECK'
+                )
+            else:
+                audit_logger.log_with_context(
+                    logger, logging.INFO, f"IPFS executable found at {ipfs_exe}",
+                    component='MAIN', operation='IPFS_CHECK',
+                    extra_data={'ipfs_path': ipfs_exe, 'exists': True}
+                )
+
+            # Get public IP and initialize connection pool
+            with OperationContext("GET_PUBLIC_IP", 'MAIN', logger, log_start=False):
+                source_ip = get_public_ip()
+
+            # Initialize Telegram notifications
+            with OperationContext("INIT_TELEGRAM", 'MAIN', logger, log_start=False):
+                telegram_enabled = initialize_telegram_notifications()
+
+            with OperationContext("INIT_CONNECTION_POOL", 'MAIN', logger):
+                init_connection_pool()
+
+            # Send startup notification
+            if telegram_enabled:
+                try:
+                    notify_startup("Distributed Token Sync - Azure SQL Database")
+                except Exception as e:
+                    logger.warning(f"Failed to send startup notification: {e}")
+
+            # Create Azure SQL Database tables
+            with OperationContext("CREATE_AZURE_SQL_TABLES", 'MAIN', logger):
+                create_azure_sql_tables()
+
+            # Create sync session for tracking
+            with OperationContext("CREATE_SYNC_SESSION", 'MAIN', logger, log_start=False):
+                session_id = create_sync_session(source_ip)
+                audit_logger.log_with_context(
+                    logger, logging.INFO, f"Started sync session: {session_id}",
+                    component='MAIN', operation='SESSION_START',
+                    extra_data={'session_id': session_id, 'source_ip': source_ip}
+                )
+
+            # Find all rubix.db files
+            with OperationContext("FIND_DATABASES", 'MAIN', logger):
+                databases = find_rubix_databases()
+                sync_metrics.total_databases_found = len(databases)
+
+                audit_logger.log_with_context(
+                    logger, logging.INFO, f"Found {len(databases)} database files",
+                    component='MAIN', operation='DATABASE_DISCOVERY',
+                    extra_data={'database_count': len(databases)}
+                )
+
+                if not databases:
+                    audit_logger.log_with_context(
+                        logger, logging.WARNING, "No rubix.db files found in current directory tree",
+                        component='MAIN', operation='DATABASE_DISCOVERY'
+                    )
+                    return
+
+            # Get already processed databases
+            with OperationContext("GET_PROCESSED_DATABASES", 'MAIN', logger, log_start=False):
+                processed_dbs = get_processed_databases()
+                audit_logger.log_with_context(
+                    logger, logging.INFO, f"Found {len(processed_dbs)} previously processed databases",
+                    component='MAIN', operation='PROCESSED_CHECK',
+                    extra_data={'processed_count': len(processed_dbs)}
+                )
+
+            # Filter databases that need processing
+            databases_to_process = [
+                (db_path, last_mod)
+                for db_path, last_mod in databases
+                if needs_processing(db_path, last_mod, processed_dbs)
+            ]
+
+            if not databases_to_process:
+                audit_logger.log_with_context(
+                    logger, logging.INFO, "All databases are up to date. Nothing to process.",
+                    component='MAIN', operation='PROCESSING_CHECK',
+                    extra_data={'up_to_date_count': len(databases)}
+                )
+                return
+
+            audit_logger.log_with_context(
+                logger, logging.INFO,
+                f"Processing {len(databases_to_process)} databases ({len(databases) - len(databases_to_process)} up to date)",
+                component='MAIN', operation='PROCESSING_PLAN',
+                extra_data={
+                    'to_process': len(databases_to_process),
+                    'up_to_date': len(databases) - len(databases_to_process),
+                    'total': len(databases)
+                }
+            )
+
+            # Process each database with enhanced monitoring
+            for idx, (db_path, db_last_modified) in enumerate(databases_to_process, 1):
+                db_correlation_id = audit_logger.start_operation(f"PROCESS_DB_{idx}")
+                db_start_time = time.time()
+
+                audit_logger.log_with_context(
+                    logger, logging.INFO, f"[{idx}/{len(databases_to_process)}] Processing: {db_path}",
+                    component='MAIN', operation='DATABASE_PROCESSING',
+                    extra_data={
+                        'database_index': idx,
+                        'total_databases': len(databases_to_process),
+                        'db_path': db_path,
+                        'db_last_modified': db_last_modified
+                    }
+                )
+
+                # Process database and fetch IPFS data
+                with OperationContext(f"PROCESS_DATABASE_{Path(db_path).stem}", 'SYNC', sync_logger):
+                    records = process_database(db_path, db_last_modified, source_ip, script_dir)
+
+                if records:
+                    # Update global metrics
+                    sync_metrics.total_records_processed += len(records)
+                    ipfs_success = sum(1 for r in records if r.ipfs_fetched)
+                    ipfs_fail = len(records) - ipfs_success
+                    validation_errors = sum(1 for r in records if r.validation_errors)
+
+                    sync_metrics.total_ipfs_success += ipfs_success
+                    sync_metrics.total_ipfs_failures += ipfs_fail
+
+                    # Log processing summary for this database
+                    log_sync_progress(Path(db_path).stem, {
+                        'records_found': len(records),
+                        'ipfs_success': ipfs_success,
+                        'ipfs_failures': ipfs_fail,
+                        'validation_errors': validation_errors,
+                        'database_index': idx,
+                        'total_databases': len(databases_to_process)
+                    })
+
+                    # Use optimized bulk insert
+                    with OperationContext(f"INSERT_RECORDS_{len(records)}", 'SQL', sql_logger):
+                        if len(records) >= BULK_INSERT_SIZE:
+                            audit_logger.log_with_context(
+                                logger, logging.INFO, f"Using bulk insert for {len(records)} records",
+                                component='SQL', operation='BULK_INSERT_DECISION',
+                                extra_data={'record_count': len(records), 'threshold': BULK_INSERT_SIZE}
+                            )
+                            success_count, error_count = bulk_insert_records(records)
+                        else:
+                            # Process in batches
+                            success_count = 0
+                            error_count = 0
+                            batch_count = 0
+                            for batch_start in range(0, len(records), BATCH_SIZE):
+                                batch_end = min(batch_start + BATCH_SIZE, len(records))
+                                batch = records[batch_start:batch_end]
+                                batch_count += 1
+
+                                audit_logger.log_with_context(
+                                    logger, logging.DEBUG, f"Processing batch {batch_count}",
+                                    component='SQL', operation='BATCH_INSERT',
+                                    extra_data={
+                                        'batch_number': batch_count,
+                                        'batch_size': len(batch),
+                                        'batch_start': batch_start,
+                                        'batch_end': batch_end
+                                    }
+                                )
+
+                                batch_success, batch_errors = bulk_insert_records(batch)
+                                success_count += batch_success
+                                error_count += batch_errors
+
+                    # Update processing metadata
+                    processing_duration = time.time() - db_start_time
+                    update_processed_database(db_path, db_last_modified, len(records),
+                                            ipfs_success, ipfs_fail, validation_errors, processing_duration)
+
+                    sync_metrics.total_databases_processed += 1
+
+                    # Log database completion
+                    db_metrics = {
+                        'processing_duration': processing_duration,
+                        'records_processed': len(records),
+                        'success_count': success_count,
+                        'error_count': error_count,
+                        'ipfs_success_rate': (ipfs_success / len(records)) * 100,
+                        'database_index': idx
+                    }
+
+                    audit_logger.log_with_context(
+                        logger, logging.INFO, f"Database {Path(db_path).stem} processing completed",
+                        component='MAIN', operation='DATABASE_COMPLETED',
+                        extra_data=db_metrics
+                    )
+
+                    # Send Telegram notification for significant databases
+                    if telegram_enabled:
+                        try:
+                            notify_database_completed(Path(db_path).stem, db_metrics)
+                        except Exception as e:
+                            logger.warning(f"Failed to send database completion notification: {e}")
+
+                audit_logger.end_operation()  # End database processing operation
+
+                # Progress reporting
+                if idx % PROGRESS_REPORT_INTERVAL == 0 or idx == len(databases_to_process):
+                    elapsed = time.time() - sync_metrics.start_time.timestamp()
+                    progress_pct = (idx / len(databases_to_process)) * 100
+                    rate = sync_metrics.total_records_processed / max(elapsed, 1)
+
+                    progress_data = {
+                        'progress_percentage': progress_pct,
+                        'databases_completed': idx,
+                        'total_databases': len(databases_to_process),
+                        'records_processed': sync_metrics.total_records_processed,
+                        'processing_rate': rate,
+                        'ipfs_success': sync_metrics.total_ipfs_success,
+                        'sql_errors': sync_metrics.total_sql_errors,
+                        'elapsed_time': elapsed
+                    }
+
+                    audit_logger.log_with_context(
+                        logger, logging.INFO,
+                        f"Progress: {progress_pct:.1f}% | Records: {sync_metrics.total_records_processed:,} | "
+                        f"Rate: {rate:.1f}/sec | IPFS Success: {sync_metrics.total_ipfs_success:,} | "
+                        f"SQL Errors: {sync_metrics.total_sql_errors:,}",
+                        component='MAIN', operation='PROGRESS_REPORT',
+                        extra_data=progress_data
+                    )
+
+                    # Send Telegram progress notification
+                    if telegram_enabled:
+                        try:
+                            notify_progress(progress_data)
+                        except Exception as e:
+                            logger.warning(f"Failed to send progress notification: {e}")
+
+            # Update final session metrics
+            if session_id:
+                with OperationContext("UPDATE_FINAL_SESSION", 'MAIN', logger, log_start=False):
+                    update_sync_session(session_id, sync_metrics, "COMPLETED")
+
+            # Generate comprehensive final report
+            with OperationContext("GENERATE_FINAL_REPORT", 'MAIN', logger):
+                generate_final_report()
+
+                # Send Telegram completion notification
+                if telegram_enabled:
+                    try:
+                        final_metrics = sync_metrics.to_dict()
+                        notify_completion(final_metrics)
+                    except Exception as e:
+                        logger.warning(f"Failed to send completion notification: {e}")
+
+        except KeyboardInterrupt:
+            audit_logger.log_with_context(
+                logger, logging.WARNING, "Process interrupted by user",
+                component='MAIN', operation='INTERRUPTION'
+            )
+            if session_id:
+                sync_metrics.add_error("system", "Process interrupted by user")
+                update_sync_session(session_id, sync_metrics, "INTERRUPTED")
+
+            # Send Telegram notification for interruption
+            if telegram_enabled:
+                try:
+                    notify_error("system", "Sync process interrupted by user", {
+                        'session_id': session_id,
+                        'records_processed': sync_metrics.total_records_processed
+                    })
+                except Exception:
+                    pass
+
+            sys.exit(1)
+
+        except Exception as e:
+            audit_logger.log_with_context(
+                logger, logging.ERROR, f"Fatal error: {e}",
+                component='MAIN', operation='FATAL_ERROR',
+                exc_info=True
+            )
+            sync_metrics.add_error("system", f"Fatal error: {e}")
+            if session_id:
+                update_sync_session(session_id, sync_metrics, "FAILED")
+
+            # Send Telegram notification for fatal error
+            if telegram_enabled:
+                try:
+                    notify_error("system", f"Fatal sync error: {str(e)[:200]}", {
+                        'session_id': session_id,
+                        'error_type': type(e).__name__,
+                        'records_processed': sync_metrics.total_records_processed
+                    })
+                except Exception:
+                    pass
+
+            sys.exit(1)
+
+        finally:
+            # Clean up resources
+            try:
+                # Clean up connection pool
+                if connection_pool:
+                    connection_pool.close_all()
+                    audit_logger.log_with_context(
+                        logger, logging.INFO, "Connection pool closed",
+                        component='MAIN', operation='CLEANUP'
+                    )
+
+                # Shutdown Telegram notifications
+                if TELEGRAM_AVAILABLE:
+                    shutdown_telegram()
+
+                # End main operation
+                audit_logger.end_operation()
+
+            except Exception as cleanup_error:
+                print(f"Error during cleanup: {cleanup_error}")
+
+
+if __name__ == "__main__":
+    main()
