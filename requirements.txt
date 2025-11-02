@@ -1,5 +1,12 @@
-pyodbc==5.0.1
-requests==2.31.0
-pandas==2.1.4
-sqlalchemy==2.0.23
-python-telegram-bot==20.7
+# Core dependencies for Azure SQL Database and IPFS sync
+pyodbc>=4.0.0,<6.0.0
+requests>=2.25.0,<3.0.0
+
+# Data processing - compatible with Python 3.8+
+pandas>=1.3.0,<3.0.0
+
+# Database ORM - compatible with Python 3.8+
+sqlalchemy>=1.4.0,<3.0.0
+
+# Telegram notifications - compatible with Python 3.8+
+python-telegram-bot>=20.0,<21.0

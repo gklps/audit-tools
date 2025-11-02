@@ -294,7 +294,22 @@ install_python_deps() {
 
     # Install Python packages
     pip3 install --upgrade pip
-    pip3 install -r requirements.txt
+
+    # Try installing with flexible requirements first
+    if pip3 install -r requirements.txt; then
+        print_success "All dependencies installed successfully."
+    else
+        print_warning "Main requirements failed. Trying minimal requirements..."
+        if pip3 install -r requirements-minimal.txt; then
+            print_success "Minimal dependencies installed successfully."
+        else
+            print_error "Package installation failed. Installing core packages individually..."
+            pip3 install "pyodbc>=4.0.0" || print_warning "Failed to install pyodbc"
+            pip3 install "requests>=2.25.0" || print_warning "Failed to install requests"
+            pip3 install "pandas>=1.3.0,<2.1.0" || print_warning "Failed to install pandas"
+            pip3 install "python-telegram-bot>=13.0,<21.0" || print_warning "Failed to install telegram bot"
+        fi
+    fi
 
     # Verify installations
     python3 -c "
