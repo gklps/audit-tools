@@ -1885,14 +1885,56 @@ def cleanup_ipfs_lock_errors():
             conn.close()
             return False
 
-        # Delete records with lock errors
-        cursor.execute("""
-            DELETE FROM [dbo].[TokenRecords]
-            WHERE [ipfs_error] LIKE '%repo.lock%'
-        """)
-        conn.commit()
+        # Delete records with lock errors in batches to avoid timeout
+        batch_size = 10000
+        total_deleted = 0
+        start_time = time.time()
 
-        print(f"✅ Successfully deleted {lock_error_count:,} records with lock errors")
+        print(f"🔄 Deleting {lock_error_count:,} records in batches of {batch_size:,}...")
+        print("📊 Progress monitoring:")
+
+        while True:
+            batch_start = time.time()
+
+            cursor.execute(f"""
+                DELETE TOP ({batch_size}) FROM [dbo].[TokenRecords]
+                WHERE [ipfs_error] LIKE '%repo.lock%'
+            """)
+
+            deleted_count = cursor.rowcount
+            if deleted_count == 0:
+                break
+
+            total_deleted += deleted_count
+            conn.commit()
+
+            # Calculate progress and timing
+            progress_pct = (total_deleted / lock_error_count) * 100
+            elapsed_time = time.time() - start_time
+            batch_time = time.time() - batch_start
+
+            if total_deleted > 0:
+                avg_rate = total_deleted / elapsed_time
+                estimated_remaining = (lock_error_count - total_deleted) / avg_rate if avg_rate > 0 else 0
+                eta_mins = estimated_remaining / 60
+            else:
+                eta_mins = 0
+
+            # Progress bar
+            bar_width = 30
+            filled_width = int(bar_width * progress_pct / 100)
+            bar = "█" * filled_width + "░" * (bar_width - filled_width)
+
+            print(f"   [{bar}] {progress_pct:5.1f}% | "
+                  f"{total_deleted:,}/{lock_error_count:,} | "
+                  f"Rate: {avg_rate:,.0f}/s | "
+                  f"ETA: {eta_mins:.1f}m | "
+                  f"Batch: {batch_time:.2f}s")
+
+            # Small delay to prevent overwhelming the database
+            time.sleep(0.1)
+
+        print(f"✅ Successfully deleted {total_deleted:,} records with lock errors")
         conn.close()
         return True
 

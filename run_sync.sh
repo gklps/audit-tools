@@ -195,6 +195,9 @@ run_sync() {
     if [[ "$FORCE_IPFS" == true ]]; then
         sync_cmd+=" --force-ipfs"
     fi
+    if [[ "$CLEANUP_LOCKS" == true ]]; then
+        sync_cmd+=" --cleanup-locks"
+    fi
 
     print_status "Executing: $sync_cmd"
 
@@ -212,7 +215,7 @@ run_sync() {
         if [ -f "logs/sync_main_$(date +%Y%m%d).log" ]; then
             echo ""
             print_status "📊 Final Statistics (from logs):"
-            grep -E "(COMPLETED|Progress: 100|Total records|IPFS successful|Duration)" logs/sync_main_$(date +%Y%m%d).log | tail -10 || echo "  No completion statistics found"
+            grep -E "(COMPLETED|Progress: 100|Total records|IPFS successful|Duration|Lock cleanup|Batch.*deleted)" logs/sync_main_$(date +%Y%m%d).log | tail -10 || echo "  No completion statistics found"
         fi
 
         # Check for errors
@@ -269,16 +272,18 @@ show_help() {
     echo "Usage: $0 [options]"
     echo ""
     echo "Options:"
-    echo "  --clear        Clear all existing records before sync"
-    echo "  --force-ipfs   Force IPFS fetch for all tokens (re-fetch)"
-    echo "  --test-only    Only test connections, don't run sync"
-    echo "  --background   Run in background (nohup)"
-    echo "  --help         Show this help message"
+    echo "  --clear          Clear all existing records before sync"
+    echo "  --force-ipfs     Force IPFS fetch for all tokens (re-fetch)"
+    echo "  --cleanup-locks  Clean up IPFS lock errors from database"
+    echo "  --test-only      Only test connections, don't run sync"
+    echo "  --background     Run in background (nohup)"
+    echo "  --help           Show this help message"
     echo ""
     echo "Examples:"
     echo "  $0                         # Standard incremental sync"
     echo "  $0 --clear --force-ipfs    # Complete fresh sync (delete all + re-fetch)"
     echo "  $0 --force-ipfs           # Re-fetch IPFS data only"
+    echo "  $0 --cleanup-locks        # Clean up IPFS lock errors only"
     echo "  $0 --test-only            # Test connections only"
     echo "  $0 --background           # Run in background"
     echo ""
@@ -304,6 +309,7 @@ main() {
     BACKGROUND=false
     CLEAR_DATA=false
     FORCE_IPFS=false
+    CLEANUP_LOCKS=false
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -321,6 +327,10 @@ main() {
                 ;;
             --background)
                 BACKGROUND=true
+                shift
+                ;;
+            --cleanup-locks)
+                CLEANUP_LOCKS=true
                 shift
                 ;;
             --help)
@@ -363,6 +373,7 @@ main() {
     print_status "🎯 Sync Configuration:"
     echo "   📊 Clear existing data: $(if [[ "$CLEAR_DATA" == true ]]; then echo "✅ YES (will delete all records)"; else echo "❌ NO (incremental sync)"; fi)"
     echo "   🔄 Force IPFS fetch: $(if [[ "$FORCE_IPFS" == true ]]; then echo "✅ YES (re-fetch all IPFS data)"; else echo "❌ NO (use cached data)"; fi)"
+    echo "   🔧 Cleanup lock errors: $(if [[ "$CLEANUP_LOCKS" == true ]]; then echo "✅ YES (will fix IPFS lock conflicts)"; else echo "❌ NO (skip lock cleanup)"; fi)"
     echo "   🧪 Test only mode: $(if [[ "$TEST_ONLY" == true ]]; then echo "✅ YES"; else echo "❌ NO"; fi)"
     echo "   📱 Background mode: $(if [[ "$BACKGROUND" == true ]]; then echo "✅ YES"; else echo "❌ NO"; fi)"
 
@@ -371,6 +382,16 @@ main() {
         echo ""
         print_warning "⚠️  WARNING: --clear will DELETE ALL existing token records!"
         print_warning "⚠️  This is irreversible. Make sure you want to start fresh."
+    fi
+
+    # Info for cleanup operations
+    if [[ "$CLEANUP_LOCKS" == true ]]; then
+        echo ""
+        print_status "🔧 IPFS Lock Cleanup Mode:"
+        print_status "   • Will identify and clean up IPFS lock error records"
+        print_status "   • Uses batched deletion with progress monitoring"
+        print_status "   • Re-attempts IPFS fetch for cleaned records"
+        print_status "   • Safe operation - only fixes lock conflicts"
     fi
 
     # Confirm before starting
