@@ -15,7 +15,7 @@ import time
 import requests
 import json
 import pyodbc
-import pandas as pd
+# import pandas as pd  # Removed - not used in the script
 from typing import List, Optional, Tuple, Dict, Any
 from multiprocessing import Pool, cpu_count
 from datetime import datetime, timezone
@@ -764,12 +764,14 @@ def safe_str(value) -> Optional[str]:
     """Safely convert value to string, handling None and empty strings."""
     if value is None or value == '':
         return None
+    if value == 'c not found':
+        return 'c not found'  # Preserve placeholder for missing columns
     return str(value).strip() if str(value).strip() else None
 
 
 def safe_timestamp(value) -> Optional[datetime]:
     """Safely convert value to datetime, handling various formats and None."""
-    if value is None or value == '':
+    if value is None or value == '' or value == 'c not found':
         return None
 
     if isinstance(value, datetime):
@@ -1189,12 +1191,25 @@ def process_database(db_path: str, db_last_modified: float, source_ip: str, scri
             conn.close()
             return []
 
-        # Read all tokens
-        cursor.execute("""
-            SELECT did, token_id, created_at, updated_at,
-                   token_status, parent_token_id, token_value
-            FROM TokensTable
-        """)
+        # Check which columns exist in TokensTable
+        cursor.execute("PRAGMA table_info(TokensTable)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        # Build dynamic query with missing column handling
+        column_selects = []
+        expected_columns = ['did', 'token_id', 'created_at', 'updated_at', 'token_status', 'parent_token_id', 'token_value']
+
+        for col in expected_columns:
+            if col in existing_columns:
+                column_selects.append(col)
+            else:
+                column_selects.append(f"'c not found' as {col}")
+
+        query = f"SELECT {', '.join(column_selects)} FROM TokensTable"
+        logger.info(f"  SQLite query for {node_name}: {query}")
+
+        # Read all tokens with dynamic column handling
+        cursor.execute(query)
 
         token_rows = cursor.fetchall()
         conn.close()
