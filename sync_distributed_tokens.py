@@ -175,6 +175,18 @@ class AuditFormatter(logging.Formatter):
 
         return formatted
 
+# Detect if running in multiprocessing worker
+def is_multiprocessing_worker():
+    """Detect if we're running in a multiprocessing worker process"""
+    try:
+        # Check if we have a multiprocessing current_process
+        from multiprocessing import current_process
+        process = current_process()
+        # Main process is usually named 'MainProcess', workers have different names
+        return process.name != 'MainProcess'
+    except:
+        return False
+
 # Setup comprehensive logging with multiple handlers
 def setup_detailed_logging():
     """Setup detailed logging with multiple log files and audit trails"""
@@ -200,6 +212,20 @@ def setup_detailed_logging():
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
+    # Check if we're in a multiprocessing worker
+    if is_multiprocessing_worker():
+        # For workers: Only use console logging to avoid file rotation conflicts
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(logging.ERROR)  # Only show errors from workers
+        console_formatter = logging.Formatter(
+            '%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%H:%M:%S'
+        )
+        console_handler.setFormatter(console_formatter)
+        main_logger.addHandler(console_handler)
+        return main_logger
+
+    # For main process: Use full logging with file rotation
     # 1. Main application log (rotating)
     main_handler = RotatingFileHandler(
         log_dir / f"sync_main_{timestamp}.log",
@@ -227,9 +253,9 @@ def setup_detailed_logging():
     error_handler.setLevel(logging.ERROR)
     error_handler.setFormatter(formatter)
 
-    # 4. Console output (clean format)
+    # 4. Console output (clean format - reduced verbosity)
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.WARNING)  # Only show warnings and errors on console
     console_formatter = logging.Formatter(
         '%(asctime)s - %(levelname)s - %(message)s',
         datefmt='%H:%M:%S'
@@ -249,7 +275,11 @@ def get_component_logger(component_name: str):
     """Get a logger for a specific component with proper context"""
     logger = logging.getLogger(f"{__name__}.{component_name}")
 
-    # Create component-specific log file
+    # Skip file handlers for multiprocessing workers to avoid conflicts
+    if is_multiprocessing_worker():
+        return logger
+
+    # Create component-specific log file (only for main process)
     log_dir = Path("logs")
     timestamp = datetime.now().strftime("%Y%m%d")
 
@@ -1063,18 +1093,19 @@ def fetch_ipfs_data(token_id: str, ipfs_path: str, script_dir: str) -> Tuple[Opt
             env = os.environ.copy()
             env['IPFS_PATH'] = ipfs_path
 
-            # Log the attempt
-            audit_logger.log_with_context(
-                ipfs_logger, logging.DEBUG,
-                f"Attempting IPFS fetch for token {token_id}",
-                component='IPFS', operation='FETCH',
-                extra_data={
-                    'token_id': token_id,
-                    'ipfs_path': ipfs_path,
-                    'script_dir': script_dir,
-                    'timeout': IPFS_TIMEOUT
-                }
-            )
+            # Log the attempt (only in main process to avoid multiprocessing conflicts)
+            if not is_multiprocessing_worker():
+                audit_logger.log_with_context(
+                    ipfs_logger, logging.DEBUG,
+                    f"Attempting IPFS fetch for token {token_id}",
+                    component='IPFS', operation='FETCH',
+                    extra_data={
+                        'token_id': token_id,
+                        'ipfs_path': ipfs_path,
+                        'script_dir': script_dir,
+                        'timeout': IPFS_TIMEOUT
+                    }
+                )
 
             # Handle IPFS repository lock conflicts
             max_lock_retries = 3
@@ -1167,18 +1198,22 @@ def fetch_ipfs_data(token_id: str, ipfs_path: str, script_dir: str) -> Tuple[Opt
                 duration=duration, success=False, error=error_msg
             )
 
-            # Log full exception details
-            audit_logger.log_with_context(
-                ipfs_logger, logging.ERROR,
-                f"Unexpected error fetching IPFS data for token {token_id}",
-                component='IPFS', operation='FETCH',
-                extra_data={
-                    'token_id': token_id,
-                    'error': error_msg,
-                    'exception_type': type(e).__name__
-                },
-                exc_info=True
-            )
+            # Log full exception details (allow ERROR logging but reduce verbosity in workers)
+            if not is_multiprocessing_worker():
+                audit_logger.log_with_context(
+                    ipfs_logger, logging.ERROR,
+                    f"Unexpected error fetching IPFS data for token {token_id}",
+                    component='IPFS', operation='FETCH',
+                    extra_data={
+                        'token_id': token_id,
+                        'error': error_msg,
+                        'exception_type': type(e).__name__
+                    },
+                    exc_info=True
+                )
+            else:
+                # In workers, just print to stdout without file logging
+                print(f"ERROR: IPFS fetch failed for {token_id}: {error_msg}", flush=True)
 
             return (None, False, error_msg)
 
@@ -1746,6 +1781,7 @@ def process_database_incremental(db_path: str, db_last_modified: float, source_i
                         total_ipfs_fail += batch_ipfs_fail
                     else:
                         logger.error(f"    ❌ Batch {batch_idx + 1} insertion failed: {error_count} errors out of {len(batch_records)} records")
+                        print(f"    ❌ Batch {batch_idx + 1} insertion failed: {error_count} errors", flush=True)
                         # Continue processing remaining batches even if one fails
 
                 batch_time = time.time() - batch_start_time
@@ -1785,6 +1821,11 @@ def process_database_incremental(db_path: str, db_last_modified: float, source_i
         logger.info(f"    ✅ Successful batches: {successful_batches}/{total_batches} ({success_rate:.1f}%)")
         logger.info(f"    📦 Total tokens processed: {total_processed:,}/{total_tokens:,}")
         logger.info(f"    🔗 IPFS success: {total_ipfs_success:,}, failed: {total_ipfs_fail:,}")
+
+        # Also print summary to console for user visibility
+        print(f"\n✅ {node_name} Complete: {total_processed:,}/{total_tokens:,} tokens | "
+              f"IPFS: {total_ipfs_success:,} success, {total_ipfs_fail:,} failed | "
+              f"Success Rate: {success_rate:.1f}%\n", flush=True)
 
         # Update processed database metadata
         update_processed_database(
@@ -2702,6 +2743,10 @@ def main():
         logger, logging.INFO, "=" * 80,
         component='MAIN', operation='STARTUP'
     )
+    # Show startup message on console
+    print("🚀 Starting Distributed Token Sync Service (Azure SQL Database + IPFS)")
+    print("=" * 80)
+
     audit_logger.log_with_context(
         logger, logging.INFO, "Starting Distributed Token Sync Service (Azure SQL Database + IPFS)",
         component='MAIN', operation='STARTUP',
@@ -2837,6 +2882,9 @@ def main():
                     extra_data={'up_to_date_count': len(databases)}
                 )
                 return
+
+            # Show processing plan on console
+            print(f"\n🔄 Processing {len(databases_to_process)} databases ({len(databases) - len(databases_to_process)} up to date)")
 
             audit_logger.log_with_context(
                 logger, logging.INFO,
