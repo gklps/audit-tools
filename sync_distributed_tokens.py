@@ -114,7 +114,7 @@ TELEGRAM_CONFIG_FILE = 'telegram_config.json'
 NUM_DB_WORKERS = max(1, cpu_count() // 2)  # Parallel database processing
 NUM_IPFS_WORKERS = cpu_count() * 2  # Increased for better IPFS throughput
 BATCH_SIZE = 2000  # Larger batches for Azure SQL Database efficiency
-BULK_INSERT_SIZE = 10000  # Use bulk insert for large datasets
+BULK_INSERT_SIZE = 1000   # Reduced for Azure SQL stability - prevents network timeouts
 IPFS_TIMEOUT = 12  # Reduced timeout for faster failover
 CONNECTION_POOL_SIZE = 10  # Connection pool for Azure SQL
 RETRY_ATTEMPTS = 3  # Retry failed operations
@@ -1356,22 +1356,23 @@ def ensure_essential_metadata(db_path: str, source_ip: str, force_update: bool =
                 )
                 token_records.append(token_record)
 
-            # Use conflict resolution to avoid duplicates
-            success_count, error_count = bulk_insert_records(token_records)
+            # Use intelligent MERGE to preserve IPFS data and avoid duplicates
+            success_count, error_count = bulk_insert_essential_records(token_records)
 
-            logger.info(f"Essential metadata capture: {success_count} inserted, {error_count} errors")
+            logger.info(f"Essential metadata MERGE: {success_count} processed, {error_count} errors (IPFS data preserved)")
 
             audit_logger.log_with_context(
                 logger, logging.INFO,
-                f"Essential metadata captured for {node_name}: {success_count} records",
-                component='ESSENTIAL', operation='METADATA_CAPTURE',
+                f"Essential metadata MERGE for {node_name}: {success_count} records (IPFS preserved)",
+                component='ESSENTIAL', operation='METADATA_MERGE',
                 extra_data={
                     'node_name': node_name,
                     'db_path': db_path,
                     'tokens_processed': len(rows),
-                    'successful_inserts': success_count,
-                    'failed_inserts': error_count,
-                    'force_update': force_update
+                    'successful_merges': success_count,
+                    'failed_merges': error_count,
+                    'ipfs_preservation': True,
+                    'operation_type': 'MERGE with deduplication'
                 }
             )
 
@@ -1429,7 +1430,7 @@ def run_essential_metadata_capture() -> bool:
         successful_count = 0
         failed_count = 0
 
-        print("🔄 Processing databases for essential metadata...")
+        print("🔄 Processing databases for essential metadata with IPFS preservation...")
         print(f"{'Node':<20} {'Status':<15} {'Records':<10} {'Result'}")
         print("-" * 60)
 
@@ -1465,10 +1466,12 @@ def run_essential_metadata_capture() -> bool:
 
         if failed_count == 0:
             print("\n🎉 All databases processed successfully!")
-            print("💾 Essential metadata (token_id, did, source_ip, node_name) captured for all nodes")
+            print("💾 Essential metadata (token_id, did, source_ip, node_name) captured with IPFS preservation")
+            print("🔄 MERGE logic ensures no duplicates and preserves existing IPFS data")
             return True
         else:
             print(f"\n⚠️  {failed_count} databases had issues - check logs for details")
+            print("✅ MERGE logic preserved existing IPFS data for successful records")
             return successful_count > 0  # Return True if at least some succeeded
 
     except Exception as e:
@@ -1807,6 +1810,9 @@ def bulk_insert_records(records: List[TokenRecord]) -> Tuple[int, int]:
             cursor = conn.cursor()
             cursor.fast_executemany = True
 
+            # Set shorter timeout for large operations to prevent network hangs
+            conn.timeout = 300  # 5 minutes timeout
+
             insert_query = """
                 INSERT INTO [dbo].[TokenRecords]
                 ([source_ip], [node_name], [did], [token_id], [created_at], [updated_at],
@@ -1815,15 +1821,67 @@ def bulk_insert_records(records: List[TokenRecord]) -> Tuple[int, int]:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
 
-            execute_start = time.time()
-            cursor.executemany(insert_query, data)
-            execute_time = time.time() - execute_start
+            # Process in smaller chunks to prevent Azure SQL timeout
+            chunk_size = min(1000, len(data))  # Maximum 1000 records per chunk
+            total_inserted = 0
 
-            commit_start = time.time()
-            conn.commit()
-            commit_time = time.time() - commit_start
+            for i in range(0, len(data), chunk_size):
+                chunk = data[i:i + chunk_size]
+                chunk_start = time.time()
 
-            success_count = len(records)
+                # Retry logic for network failures
+                for attempt in range(RETRY_ATTEMPTS):
+                    try:
+                        cursor.executemany(insert_query, chunk)
+                        conn.commit()  # Commit each chunk
+                        total_inserted += len(chunk)
+
+                        audit_logger.log_with_context(
+                            sql_logger, logging.DEBUG,
+                            f"Chunk {i//chunk_size + 1} inserted: {len(chunk)} records",
+                            component='SQL', operation='BULK_INSERT',
+                            extra_data={
+                                'chunk_size': len(chunk),
+                                'total_progress': total_inserted,
+                                'chunk_time_ms': (time.time() - chunk_start) * 1000
+                            }
+                        )
+                        break  # Success, exit retry loop
+
+                    except pyodbc.OperationalError as e:
+                        if "Communication link failure" in str(e) and attempt < RETRY_ATTEMPTS - 1:
+                            audit_logger.log_with_context(
+                                sql_logger, logging.WARNING,
+                                f"Network failure on chunk {i//chunk_size + 1}, attempt {attempt + 1}/{RETRY_ATTEMPTS}: {e}",
+                                component='SQL', operation='BULK_INSERT'
+                            )
+
+                            # Wait before retry with exponential backoff
+                            time.sleep(2 ** attempt)
+
+                            # Reconnect to database
+                            try:
+                                pool.return_connection(conn)
+                                conn = pool.get_connection()
+                                cursor = conn.cursor()
+                                cursor.fast_executemany = True
+                                conn.timeout = 300
+                            except Exception as reconnect_error:
+                                audit_logger.log_with_context(
+                                    sql_logger, logging.ERROR,
+                                    f"Failed to reconnect: {reconnect_error}",
+                                    component='SQL', operation='RECONNECT'
+                                )
+                                raise
+                        else:
+                            raise  # Re-raise if max attempts reached or different error
+
+            execute_time = time.time() - operation_start
+
+            # No final commit needed - each chunk was committed individually
+            commit_time = 0
+
+            success_count = total_inserted
 
             # Update metrics
             sync_metrics.total_sql_inserts += success_count
@@ -1949,6 +2007,212 @@ def fallback_individual_inserts(records: List[TokenRecord]) -> Tuple[int, int]:
             pool.return_connection(conn)
 
     logger.info(f"  Fallback inserts: {success_count} succeeded, {error_count} failed")
+    return success_count, error_count
+
+
+def bulk_insert_essential_records(records: List[TokenRecord]) -> Tuple[int, int]:
+    """
+    Intelligent bulk insert/update for essential metadata with IPFS data preservation.
+    Uses MERGE logic to handle deduplication while preserving existing IPFS data.
+
+    Args:
+        records: List of TokenRecord objects with essential metadata
+
+    Returns:
+        tuple: (success_count, error_count)
+    """
+    if not records:
+        return 0, 0
+
+    operation_start = time.time()
+
+    with OperationContext(f"ESSENTIAL_MERGE_{len(records)}_RECORDS", 'SQL', sql_logger):
+        pool = init_connection_pool()
+        conn = pool.get_connection()
+        success_count = 0
+        error_count = 0
+
+        try:
+            # Log operation start
+            audit_logger.log_with_context(
+                sql_logger, logging.INFO,
+                f"Starting essential metadata MERGE for {len(records)} records",
+                component='SQL', operation='ESSENTIAL_MERGE',
+                extra_data={
+                    'record_count': len(records),
+                    'operation_type': 'MERGE with IPFS preservation'
+                }
+            )
+
+            cursor = conn.cursor()
+
+            # Process records in batches for better performance
+            batch_size = 1000
+            total_processed = 0
+
+            for i in range(0, len(records), batch_size):
+                batch = records[i:i + batch_size]
+                batch_start = time.time()
+
+                # Prepare batch data for MERGE operation
+                batch_data = []
+                for record in batch:
+                    batch_data.append([
+                        record.source_ip,
+                        record.node_name,
+                        record.did or 'c not found',
+                        record.token_id or 'c not found',
+                        record.db_path,
+                        record.ipfs_data,
+                        record.ipfs_fetched,
+                        record.ipfs_error or 'essential_capture_only',
+                        record.token_status or 'essential_only',
+                        record.db_last_modified
+                    ])
+
+                # Execute MERGE with IPFS data preservation
+                merge_query = """
+                    MERGE [dbo].[TokenRecords] AS target
+                    USING (SELECT
+                        ? AS source_ip, ? AS node_name, ? AS did, ? AS token_id, ? AS db_path,
+                        ? AS ipfs_data, ? AS ipfs_fetched, ? AS ipfs_error,
+                        ? AS token_status, ? AS db_last_modified
+                    ) AS source
+                    ON target.source_ip = source.source_ip
+                       AND target.node_name = source.node_name
+                       AND target.token_id = source.token_id
+
+                    WHEN NOT MATCHED THEN
+                        -- Insert new record (may have IPFS data from source)
+                        INSERT (source_ip, node_name, did, token_id, db_path, ipfs_data,
+                               ipfs_fetched, ipfs_error, token_status, db_last_modified, synced_at)
+                        VALUES (source.source_ip, source.node_name, source.did, source.token_id,
+                               source.db_path, source.ipfs_data, source.ipfs_fetched,
+                               source.ipfs_error, source.token_status, source.db_last_modified, GETUTCDATE())
+
+                    WHEN MATCHED THEN
+                        UPDATE SET
+                            -- Preserve any existing IPFS data, use new data only if existing is empty
+                            ipfs_data = CASE
+                                WHEN target.ipfs_data IS NOT NULL AND target.ipfs_data != '' THEN target.ipfs_data
+                                WHEN source.ipfs_data IS NOT NULL AND source.ipfs_data != '' THEN source.ipfs_data
+                                ELSE target.ipfs_data
+                            END,
+
+                            -- Update ipfs_fetched if we have new successful IPFS data
+                            ipfs_fetched = CASE
+                                WHEN target.ipfs_fetched = 1 THEN 1  -- Keep existing success
+                                WHEN source.ipfs_fetched = 1 THEN 1  -- Use new success
+                                ELSE target.ipfs_fetched
+                            END,
+
+                            -- Update ipfs_error intelligently
+                            ipfs_error = CASE
+                                WHEN target.ipfs_fetched = 1 THEN target.ipfs_error  -- Keep error from successful fetch
+                                WHEN source.ipfs_fetched = 1 THEN source.ipfs_error  -- Use error from new successful fetch
+                                WHEN target.ipfs_error IS NOT NULL AND target.ipfs_error != 'essential_capture_only' THEN target.ipfs_error
+                                ELSE source.ipfs_error
+                            END,
+
+                            -- Always update essential metadata to latest
+                            did = COALESCE(source.did, target.did),
+                            db_path = COALESCE(source.db_path, target.db_path),
+                            token_status = CASE
+                                WHEN target.ipfs_fetched = 1 THEN target.token_status  -- Keep status if IPFS successful
+                                ELSE COALESCE(source.token_status, target.token_status)
+                            END,
+                            db_last_modified = COALESCE(source.db_last_modified, target.db_last_modified),
+                            synced_at = GETUTCDATE();
+                """
+
+                # Execute MERGE for each record in batch
+                for record_data in batch_data:
+                    try:
+                        cursor.execute(merge_query, record_data)
+                        success_count += 1
+                    except Exception as record_error:
+                        error_count += 1
+                        audit_logger.log_with_context(
+                            sql_logger, logging.WARNING,
+                            f"Failed to merge essential record: {record_error}",
+                            component='SQL', operation='ESSENTIAL_MERGE',
+                            extra_data={
+                                'error': str(record_error),
+                                'record_data': record_data[:4]  # source_ip, node_name, did, token_id
+                            }
+                        )
+
+                # Commit batch
+                conn.commit()
+                total_processed += len(batch)
+                batch_time = time.time() - batch_start
+
+                # Log batch progress
+                audit_logger.log_with_context(
+                    sql_logger, logging.DEBUG,
+                    f"Essential MERGE batch completed: {len(batch)} records",
+                    component='SQL', operation='ESSENTIAL_MERGE',
+                    extra_data={
+                        'batch_size': len(batch),
+                        'batch_time_ms': batch_time * 1000,
+                        'total_processed': total_processed,
+                        'records_per_second': len(batch) / batch_time
+                    }
+                )
+
+            # Log successful operation
+            total_duration = time.time() - operation_start
+
+            audit_logger.log_with_context(
+                sql_logger, logging.INFO,
+                f"Essential metadata MERGE completed: {success_count} success, {error_count} errors",
+                component='SQL', operation='ESSENTIAL_MERGE',
+                extra_data={
+                    'total_duration_ms': total_duration * 1000,
+                    'success_count': success_count,
+                    'error_count': error_count,
+                    'records_per_second': success_count / total_duration if total_duration > 0 else 0,
+                    'total_records': len(records)
+                }
+            )
+
+        except Exception as e:
+            error_duration = time.time() - operation_start
+            error_msg = str(e)
+
+            audit_logger.log_with_context(
+                sql_logger, logging.ERROR,
+                f"Essential metadata MERGE failed: {error_msg}",
+                component='SQL', operation='ESSENTIAL_MERGE',
+                extra_data={
+                    'error': error_msg,
+                    'error_type': type(e).__name__,
+                    'duration_ms': error_duration * 1000,
+                    'record_count': len(records)
+                },
+                exc_info=True
+            )
+
+            try:
+                conn.rollback()
+                audit_logger.log_with_context(
+                    sql_logger, logging.INFO,
+                    "Transaction rolled back successfully",
+                    component='SQL', operation='ROLLBACK'
+                )
+            except Exception as rollback_error:
+                audit_logger.log_with_context(
+                    sql_logger, logging.ERROR,
+                    f"Rollback failed: {rollback_error}",
+                    component='SQL', operation='ROLLBACK',
+                    exc_info=True
+                )
+
+            error_count = len(records)
+
+        finally:
+            pool.return_connection(conn)
+
     return success_count, error_count
 
 

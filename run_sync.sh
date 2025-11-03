@@ -65,8 +65,72 @@ except ImportError as e:
     print(f'❌ Missing Python package: {e}')
     sys.exit(1)
 " || {
-        print_error "Python dependencies not met. Install with: pip3 install pyodbc requests"
-        exit 1
+        print_error "Python dependencies not met. Installing required packages..."
+
+        # Try to install using system package manager first
+        if command -v apt >/dev/null 2>&1; then
+            print_status "Installing Python packages via apt (recommended for Ubuntu)..."
+
+            # Install system packages
+            if ! dpkg -l | grep -q python3-pyodbc; then
+                print_status "Installing python3-pyodbc..."
+                sudo apt update -q
+                sudo apt install -y python3-pyodbc python3-requests python3-venv python3-full unixodbc-dev
+            fi
+
+            # Install Microsoft ODBC driver if not present
+            if ! dpkg -l | grep -q msodbcsql; then
+                print_status "Installing Microsoft ODBC Driver for SQL Server..."
+
+                # Add Microsoft repository
+                curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+                curl -fsSL https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+
+                sudo apt update -q
+                ACCEPT_EULA=Y sudo apt install -y msodbcsql18 mssql-tools18
+
+                # Add tools to PATH
+                echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
+                source ~/.bashrc
+            fi
+
+        elif command -v yum >/dev/null 2>&1; then
+            print_status "Installing Python packages via yum..."
+            sudo yum install -y python3-pyodbc python3-requests python3-venv
+
+        else
+            print_warning "No supported package manager found. Creating virtual environment..."
+
+            # Create virtual environment as fallback
+            if [ ! -d "venv" ]; then
+                python3 -m venv venv
+                source venv/bin/activate
+                pip install pyodbc requests
+            else
+                source venv/bin/activate
+            fi
+        fi
+
+        # Verify installation worked
+        python3 -c "
+import sys
+try:
+    import pyodbc
+    import requests
+    print('✅ Python packages installed successfully')
+except ImportError as e:
+    print(f'❌ Package installation failed: {e}')
+    print('🔧 Manual installation required:')
+    print('   Option 1: sudo apt install python3-pyodbc python3-requests')
+    print('   Option 2: python3 -m venv venv && source venv/bin/activate && pip install pyodbc requests')
+    print('   Option 3: pip3 install --break-system-packages pyodbc requests (not recommended)')
+    sys.exit(1)
+" || {
+            print_error "Failed to install Python dependencies. Please install manually:"
+            echo "  Ubuntu/Debian: sudo apt install python3-pyodbc python3-requests"
+            echo "  Or create venv: python3 -m venv venv && source venv/bin/activate && pip install pyodbc requests"
+            exit 1
+        }
     }
 
     # Check configuration files
