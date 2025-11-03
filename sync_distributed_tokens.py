@@ -1624,8 +1624,199 @@ def needs_processing(db_path: str, db_last_modified: float, processed_dbs: Dict[
     return db_last_modified > processed_dbs[db_path]
 
 
+def process_database_incremental(db_path: str, db_last_modified: float, source_ip: str, script_dir: str, ipfs_mapping: Dict[str, str]) -> bool:
+    """
+    Process a single database with incremental 1000-record batches for resilience.
+    Processes IPFS and inserts to database in small batches to avoid timeouts and ensure progress is saved.
+
+    Args:
+        db_path: Path to the SQLite database
+        db_last_modified: Last modified timestamp of the database
+        source_ip: Source IP address for audit tracking
+        script_dir: Script directory path
+        ipfs_mapping: Pre-built mapping of database paths to .ipfs directories
+
+    Returns:
+        bool: True if processing completed successfully
+    """
+    try:
+        # Extract node name and get pre-mapped IPFS directory
+        node_name = extract_node_name(db_path)
+        ipfs_path = ipfs_mapping.get(db_path)
+
+        logger.info(f"🔄 Starting incremental processing for {node_name}: {db_path}")
+        if ipfs_path:
+            logger.info(f"  📁 IPFS path: {ipfs_path}")
+        else:
+            logger.warning(f"  ⚠️  No IPFS path found for {node_name}")
+
+        # Connect to SQLite database
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Check if TokensTable exists
+        cursor.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='TokensTable'
+        """)
+
+        if not cursor.fetchone():
+            logger.warning(f"TokensTable not found in {db_path}")
+            conn.close()
+            return False
+
+        # Check which columns exist in TokensTable
+        cursor.execute("PRAGMA table_info(TokensTable)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        # Build dynamic query with missing column handling
+        column_selects = []
+        expected_columns = ['did', 'token_id', 'created_at', 'updated_at', 'token_status', 'parent_token_id', 'token_value']
+
+        for col in expected_columns:
+            if col in existing_columns:
+                column_selects.append(col)
+            else:
+                column_selects.append(f"'c not found' as {col}")
+
+        query = f"SELECT {', '.join(column_selects)} FROM TokensTable"
+        logger.info(f"  📊 SQLite query for {node_name}: {query}")
+
+        # Read all tokens with dynamic column handling
+        cursor.execute(query)
+        token_rows = cursor.fetchall()
+        conn.close()
+
+        total_tokens = len(token_rows)
+        logger.info(f"  📦 Found {total_tokens:,} tokens in {node_name}")
+
+        if not token_rows:
+            logger.info(f"  ✅ No tokens to process in {node_name}")
+            return True
+
+        # Process in incremental batches of 1000
+        batch_size = 1000
+        total_batches = (total_tokens + batch_size - 1) // batch_size
+        successful_batches = 0
+        total_processed = 0
+        total_ipfs_success = 0
+        total_ipfs_fail = 0
+
+        logger.info(f"  🔢 Processing {total_tokens:,} tokens in {total_batches} batches of {batch_size}")
+
+        # Track overall processing start time for accurate ETA calculation
+        processing_start_time = time.time()
+
+        for batch_idx in range(total_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, total_tokens)
+            batch_tokens = token_rows[start_idx:end_idx]
+
+            batch_start_time = time.time()
+            logger.info(f"  📋 Batch {batch_idx + 1}/{total_batches}: Processing tokens {start_idx + 1}-{end_idx}")
+
+            try:
+                # Prepare arguments for parallel processing of this batch
+                args_list = [
+                    (row, source_ip, node_name, db_path, ipfs_path, db_last_modified, script_dir)
+                    for row in batch_tokens
+                ]
+
+                # Process IPFS for this batch in parallel
+                logger.info(f"    🔄 Fetching IPFS data for {len(batch_tokens)} tokens...")
+                with Pool(processes=NUM_IPFS_WORKERS) as pool:
+                    batch_records = pool.map(process_token_ipfs, args_list)
+
+                # Count batch IPFS successes and failures
+                batch_ipfs_success = sum(1 for r in batch_records if r.ipfs_fetched)
+                batch_ipfs_fail = len(batch_records) - batch_ipfs_success
+
+                logger.info(f"    📈 IPFS results: {batch_ipfs_success} succeeded, {batch_ipfs_fail} failed")
+
+                # Immediately insert this batch to database
+                if batch_records:
+                    logger.info(f"    💾 Inserting batch {batch_idx + 1} to database...")
+                    success_count, error_count = bulk_insert_records(batch_records)
+
+                    if error_count == 0:
+                        logger.info(f"    ✅ Batch {batch_idx + 1} inserted successfully: {success_count} records")
+                        successful_batches += 1
+                        total_processed += len(batch_tokens)
+                        total_ipfs_success += batch_ipfs_success
+                        total_ipfs_fail += batch_ipfs_fail
+                    else:
+                        logger.error(f"    ❌ Batch {batch_idx + 1} insertion failed: {error_count} errors out of {len(batch_records)} records")
+                        # Continue processing remaining batches even if one fails
+
+                batch_time = time.time() - batch_start_time
+                remaining_batches = total_batches - (batch_idx + 1)
+                eta_minutes = (remaining_batches * batch_time) / 60 if batch_time > 0 else 0
+
+                # Visual progress bar
+                progress_pct = ((batch_idx + 1) / total_batches) * 100
+                bar_width = 30
+                filled_width = int(bar_width * progress_pct / 100)
+                bar = "█" * filled_width + "░" * (bar_width - filled_width)
+
+                # Calculate processing rate
+                total_time_elapsed = time.time() - processing_start_time
+                if total_time_elapsed > 0 and total_processed > 0:
+                    avg_rate = total_processed / total_time_elapsed
+                else:
+                    avg_rate = len(batch_tokens) / batch_time if batch_time > 0 else 0
+
+                print(f"    [{bar}] {progress_pct:5.1f}% | "
+                      f"Batch {batch_idx + 1}/{total_batches} | "
+                      f"Processed: {total_processed:,}/{total_tokens:,} | "
+                      f"Rate: {avg_rate:,.0f}/s | "
+                      f"ETA: {eta_minutes:.1f}m | "
+                      f"IPFS: {batch_ipfs_success}/{len(batch_tokens)}", flush=True)
+
+                logger.info(f"    ⏱️  Batch {batch_idx + 1} completed in {batch_time:.1f}s | Progress: {progress_pct:.1f}% | ETA: {eta_minutes:.1f}m")
+
+            except Exception as batch_error:
+                logger.error(f"    ❌ Batch {batch_idx + 1} failed: {batch_error}")
+                logger.info(f"    🔄 Continuing with next batch...")
+                continue
+
+        # Summary for this database
+        success_rate = (successful_batches / total_batches) * 100 if total_batches > 0 else 0
+        logger.info(f"  📊 {node_name} Summary:")
+        logger.info(f"    ✅ Successful batches: {successful_batches}/{total_batches} ({success_rate:.1f}%)")
+        logger.info(f"    📦 Total tokens processed: {total_processed:,}/{total_tokens:,}")
+        logger.info(f"    🔗 IPFS success: {total_ipfs_success:,}, failed: {total_ipfs_fail:,}")
+
+        # Update processed database metadata
+        update_processed_database(
+            db_path, db_last_modified, total_processed,
+            total_ipfs_success, total_ipfs_fail, 0,
+            time.time() - batch_start_time
+        )
+
+        # Consider success if we processed at least 80% of batches
+        return success_rate >= 80.0
+
+    except sqlite3.Error as e:
+        logger.error(f"SQLite error reading {db_path}: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error processing {db_path}: {e}")
+
+        # Fallback: Ensure essential metadata is captured even if processing failed
+        logger.info(f"Attempting essential metadata capture as fallback for {db_path}")
+        if ensure_essential_metadata(db_path, source_ip):
+            logger.info(f"Essential metadata captured successfully as fallback for {extract_node_name(db_path)}")
+        else:
+            logger.error(f"Failed to capture essential metadata for {extract_node_name(db_path)}")
+
+        return False
+
+
 def process_database(db_path: str, db_last_modified: float, source_ip: str, script_dir: str, ipfs_mapping: Dict[str, str]) -> List[Tuple]:
     """
+    Legacy process_database function - kept for compatibility.
+    NEW: Use process_database_incremental() for better resilience.
+
     Process a single database: read tokens from SQLite and fetch IPFS data.
     Uses pre-mapped IPFS paths for efficiency.
 
@@ -2674,29 +2865,26 @@ def main():
                     }
                 )
 
-                # Process database and fetch IPFS data
+                # Process database with incremental batches (IPFS + immediate DB insertion)
                 with OperationContext(f"PROCESS_DATABASE_{Path(db_path).stem}", 'SYNC', sync_logger):
-                    records = process_database(db_path, db_last_modified, source_ip, script_dir, ipfs_mapping)
+                    processing_success = process_database_incremental(db_path, db_last_modified, source_ip, script_dir, ipfs_mapping)
 
-                if records:
-                    # Update global metrics
-                    sync_metrics.total_records_processed += len(records)
-                    ipfs_success = sum(1 for r in records if r.ipfs_fetched)
-                    ipfs_fail = len(records) - ipfs_success
-                    validation_errors = sum(1 for r in records if r.validation_errors)
+                if processing_success:
+                    # ✅ Incremental processing completed successfully
+                    # Note: Metrics, IPFS processing, and database insertion were all handled
+                    # incrementally in process_database_incremental()
 
-                    sync_metrics.total_ipfs_success += ipfs_success
-                    sync_metrics.total_ipfs_failures += ipfs_fail
-
-                    # Log processing summary for this database
-                    log_sync_progress(Path(db_path).stem, {
-                        'records_found': len(records),
-                        'ipfs_success': ipfs_success,
-                        'ipfs_failures': ipfs_fail,
-                        'validation_errors': validation_errors,
-                        'database_index': idx,
-                        'total_databases': len(databases_to_process)
-                    })
+                    audit_logger.log_with_context(
+                        logger, logging.INFO,
+                        f"✅ Incremental processing completed for {extract_node_name(db_path)}",
+                        component='SYNC', operation='DATABASE_PROCESSED_INCREMENTAL',
+                        extra_data={
+                            'database': db_path,
+                            'processing_method': 'incremental_1000_batches',
+                            'database_index': idx,
+                            'total_databases': len(databases_to_process)
+                        }
+                    )
 
                     # Use optimized bulk insert
                     with OperationContext(f"INSERT_RECORDS_{len(records)}", 'SQL', sql_logger):
