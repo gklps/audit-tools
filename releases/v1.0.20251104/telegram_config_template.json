@@ -1,0 +1,13 @@
+{
+  "bot_token": "8391226270:AAFv1p1nHf6gcEgXI7diiikczAW-I5Gg1KE",
+  "chat_id": "-1003231044644",
+  "enabled": true,
+  "machine_name": "Production-VM-1",
+  "public_ip": "",
+  "send_startup": true,
+  "send_progress": true,
+  "send_errors": true,
+  "send_completion": true,
+  "progress_interval": 300,
+  "max_message_length": 4000
+}

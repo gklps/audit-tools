@@ -1,0 +1,215 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.0.0)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            executable: RubixTokenSync
+            archive: tar.gz
+          - os: windows-latest
+            platform: windows
+            executable: RubixTokenSync.exe
+            archive: zip
+          - os: macos-latest
+            platform: macos
+            executable: RubixTokenSync
+            archive: tar.gz
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller psutil
+
+    - name: Install system dependencies (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y unixodbc-dev
+
+    - name: Install system dependencies (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        brew install unixodbc
+
+    - name: Install Python dependencies
+      run: |
+        pip install pyodbc requests
+
+    - name: Remove conflicting packages
+      run: |
+        pip uninstall -y pathlib || true
+
+    - name: Build executable
+      run: |
+        python build_executable.py
+
+    - name: Test executable
+      run: |
+        if [ "${{ matrix.platform }}" = "windows" ]; then
+          ./dist/RubixTokenSync.exe --help
+        else
+          ./dist/RubixTokenSync --help
+        fi
+      shell: bash
+
+    - name: Create release package
+      run: |
+        mkdir -p release-package
+
+        # Copy executable
+        if [ "${{ matrix.platform }}" = "windows" ]; then
+          cp ./dist/RubixTokenSync.exe release-package/
+        else
+          cp ./dist/RubixTokenSync release-package/
+          chmod +x release-package/RubixTokenSync
+        fi
+
+        # Copy documentation
+        cp README_EXECUTABLE.md release-package/ || true
+        cp requirements.txt release-package/ || true
+        cp azure_sql_connection_template.txt release-package/ || true
+        cp telegram_config_template.json release-package/ || true
+
+        # Create platform-specific README
+        cat > release-package/README.txt << EOF
+        # Rubix Token Sync - ${{ matrix.platform }}
+
+        ## Quick Start
+
+        1. Run the executable:
+        ${{ matrix.platform == 'windows' && '   Double-click RubixTokenSync.exe' || '   ./RubixTokenSync' }}
+
+        2. Follow the interactive setup prompts
+        3. Configure MSSQL credentials when prompted
+        4. Start syncing!
+
+        ## System Requirements
+
+        ${{ matrix.platform == 'windows' && '- Windows 10+ (64-bit)' || matrix.platform == 'macos' && '- macOS 10.14+ (Universal binary)' || '- Linux 64-bit (Ubuntu 18.04+)' }}
+        - 2GB RAM minimum
+        - 1GB free disk space
+        - Internet connection
+
+        Built on: $(date)
+        EOF
+      shell: bash
+
+    - name: Create archive
+      run: |
+        cd release-package
+        if [ "${{ matrix.archive }}" = "zip" ]; then
+          7z a ../RubixTokenSync-${{ matrix.platform }}-${{ github.ref_name }}.zip *
+        else
+          tar -czf ../RubixTokenSync-${{ matrix.platform }}-${{ github.ref_name }}.tar.gz *
+        fi
+        cd ..
+      shell: bash
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: RubixTokenSync-${{ matrix.platform }}
+        path: RubixTokenSync-${{ matrix.platform }}-${{ github.ref_name }}.*
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+
+    - name: Create release notes
+      run: |
+        cat > RELEASE_NOTES.md << 'EOF'
+        # Rubix Token Sync ${{ github.ref_name }}
+
+        ## 🚀 Cross-Platform Executable Release
+
+        This release provides standalone executables for all major operating systems. No installation required!
+
+        ### ✨ Features
+
+        - **🖥️ Interactive Menu System**: User-friendly interface with guided setup
+        - **⚙️ Automatic Configuration**: Pre-configured Telegram, simple MSSQL setup
+        - **🔍 Per-Node IPFS Detection**: Automatic binary discovery for each node
+        - **📊 System Compatibility Checking**: Built-in diagnostics and validation
+        - **📱 Real-time Notifications**: Integrated Telegram bot for live updates
+        - **🗄️ Azure SQL Database Integration**: Enterprise-grade database sync
+
+        ### 📦 Downloads
+
+        | Platform | File | Notes |
+        |----------|------|-------|
+        | **Windows** | RubixTokenSync-windows-${{ github.ref_name }}.zip | Windows 10+ (64-bit) |
+        | **macOS** | RubixTokenSync-macos-${{ github.ref_name }}.tar.gz | macOS 10.14+ (Universal) |
+        | **Linux** | RubixTokenSync-linux-${{ github.ref_name }}.tar.gz | Ubuntu 18.04+, CentOS 7+ |
+
+        ### 🔧 Quick Start
+
+        1. Download the appropriate file for your OS
+        2. Extract the archive
+        3. Run the executable:
+           - Windows: Double-click `RubixTokenSync.exe`
+           - macOS/Linux: `./RubixTokenSync`
+        4. Follow the interactive setup prompts
+
+        ### 💻 System Requirements
+
+        - **Memory**: 2GB RAM minimum
+        - **Disk**: 1GB free space minimum
+        - **Network**: Internet connection required
+
+        ### 🔒 Pre-configured
+
+        - **Telegram Bot**: Included with audit bot credentials
+        - **MSSQL Setup**: Interactive guided configuration
+        - **IPFS Detection**: Automatic binary discovery
+
+        ---
+
+        Built on: $(date)
+        Commit: ${{ github.sha }}
+        EOF
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        name: Release ${{ github.ref_name }}
+        body_path: RELEASE_NOTES.md
+        files: |
+          */RubixTokenSync-*
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

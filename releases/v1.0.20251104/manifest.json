@@ -1,0 +1,38 @@
+{
+  "version": "1.0.20251104",
+  "build_date": "2025-11-04T16:33:45.401470",
+  "git_commit": "f5536b0",
+  "platforms": {},
+  "files": [
+    {
+      "name": "requirements.txt",
+      "size": 331,
+      "size_mb": 0.0
+    },
+    {
+      "name": "azure_sql_connection_template.txt",
+      "size": 944,
+      "size_mb": 0.0
+    },
+    {
+      "name": "README_EXECUTABLE.md",
+      "size": 8612,
+      "size_mb": 0.0
+    },
+    {
+      "name": "telegram_config_template.json",
+      "size": 330,
+      "size_mb": 0.0
+    },
+    {
+      "name": "RELEASE_NOTES.md",
+      "size": 2882,
+      "size_mb": 0.0
+    },
+    {
+      "name": "RubixTokenSync-macos-v1.0.20251104.tar.gz",
+      "size": 25520215,
+      "size_mb": 24.3
+    }
+  ]
+}

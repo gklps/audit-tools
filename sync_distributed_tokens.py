@@ -107,7 +107,82 @@ def find_ipfs_binary() -> str:
     print("⚠️  Using fallback 'ipfs' command - ensure it's in PATH")
     return 'ipfs'
 
-IPFS_COMMAND = find_ipfs_binary()
+def find_node_ipfs_binary(db_path: str) -> Optional[str]:
+    """
+    Find IPFS binary for a specific node by walking up from rubix.db location.
+
+    Args:
+        db_path: Path to rubix.db file (e.g., /this/is/my/path/SafePass/Rubix/Qnode1/Rubix/rubix.db)
+
+    Returns:
+        Path to ipfs binary for this node, or None if not found
+    """
+    db_path_obj = Path(db_path)
+
+    # Start from rubix.db location and walk up
+    current_path = db_path_obj.parent  # Start from Rubix directory
+    max_levels = 10  # Reasonable limit to prevent infinite loops
+
+    for level in range(max_levels):
+        logger.debug(f"  Searching for ipfs binary at level {level}: {current_path}")
+
+        # Check for ipfs binary in current directory
+        ipfs_binary = current_path / 'ipfs'
+        if ipfs_binary.exists() and ipfs_binary.is_file():
+            try:
+                # Test if it's a working IPFS binary
+                result = subprocess.run([str(ipfs_binary), 'version'],
+                                      capture_output=True, timeout=5)
+                if result.returncode == 0:
+                    logger.debug(f"Found working IPFS binary: {ipfs_binary}")
+                    return str(ipfs_binary)
+            except:
+                pass
+
+        # Check for rubixgoplatform as indicator (90% chance ipfs is here)
+        rubixgo_binary = current_path / 'rubixgoplatform'
+        if rubixgo_binary.exists() and rubixgo_binary.is_file():
+            logger.debug(f"Found rubixgoplatform at {current_path}, checking for ipfs")
+            # Check if ipfs is also in this directory
+            ipfs_binary = current_path / 'ipfs'
+            if ipfs_binary.exists() and ipfs_binary.is_file():
+                try:
+                    result = subprocess.run([str(ipfs_binary), 'version'],
+                                          capture_output=True, timeout=5)
+                    if result.returncode == 0:
+                        logger.debug(f"Found IPFS binary with rubixgoplatform: {ipfs_binary}")
+                        return str(ipfs_binary)
+                except:
+                    pass
+
+        # Move up one level
+        if current_path == current_path.parent:  # Reached root
+            break
+        current_path = current_path.parent
+
+    # Fallback to common system locations
+    common_locations = [
+        Path('/usr/local/bin/ipfs'),
+        Path('/usr/bin/ipfs'),
+        Path('/bin/ipfs'),
+    ]
+
+    for ipfs_path in common_locations:
+        if ipfs_path.exists() and ipfs_path.is_file():
+            try:
+                result = subprocess.run([str(ipfs_path), 'version'],
+                                      capture_output=True, timeout=5)
+                if result.returncode == 0:
+                    logger.debug(f"Found IPFS binary (system fallback): {ipfs_path}")
+                    return str(ipfs_path)
+            except:
+                pass
+
+    logger.warning(f"No IPFS binary found for node: {db_path}")
+    return None
+
+
+IPFS_COMMAND = find_ipfs_binary()  # Global fallback - will be replaced with per-node detection
 TELEGRAM_CONFIG_FILE = 'telegram_config.json'
 
 # Performance tuning - Optimized for Azure SQL Database
@@ -956,25 +1031,23 @@ def find_rubix_databases(start_path: str = '.') -> List[Tuple[str, float]]:
 
 def find_ipfs_directory(db_path: str) -> Optional[str]:
     """
-    Find .ipfs directory based on logical pattern:
-    If DB is at /mnt/drived/node056/Rubix/rubix.db
-    Then .ipfs should be at /mnt/drived/.ipfs
+    Find .ipfs directory by walking UP from rubix.db location.
 
-    Pattern: Walk up from node directory to find the common root with .ipfs
+    Examples:
+    - DB at /this/is/my/path/node1/Rubix/rubix.db -> .ipfs at /this/is/my/path/node1/.ipfs
+    - DB at /this/is/my/path/SafePass/Rubix/Qnode1/Rubix/rubix.db -> .ipfs at /this/is/my/path/SafePass/Rubix/Qnode1/.ipfs
+
+    Pattern: Walk up from rubix.db location checking each level for .ipfs
     """
     db_path_obj = Path(db_path)
 
-    # Start from the node directory (parent of Rubix)
-    # e.g., /mnt/drived/node056/Rubix/rubix.db -> /mnt/drived/node056
-    node_dir = db_path_obj.parent.parent
-
-    # Walk up the directory tree to find .ipfs
-    current_path = node_dir
-    max_levels = 6  # Reasonable limit to prevent infinite loops
+    # Start from rubix.db location and walk up
+    current_path = db_path_obj.parent  # Start from Rubix directory
+    max_levels = 10  # Reasonable limit to prevent infinite loops
 
     for level in range(max_levels):
-        # Check for .ipfs at this level
-        ipfs_path = current_path.parent / '.ipfs'
+        # Check for .ipfs at current level
+        ipfs_path = current_path / '.ipfs'
 
         logger.debug(f"  Checking level {level}: {ipfs_path}")
 
@@ -993,16 +1066,17 @@ def find_ipfs_directory(db_path: str) -> Optional[str]:
                 return str(ipfs_path)
 
         # Move up one level
+        if current_path == current_path.parent:  # Reached root
+            break
         current_path = current_path.parent
 
-        # Stop if we've reached the root
-        if current_path == current_path.parent:
-            break
-
     # If pattern-based search fails, check a few common fallback locations
+    # Get node directory for fallback (parent of Rubix)
+    node_dir = db_path_obj.parent.parent
+
     fallback_locations = [
         node_dir / '.ipfs',  # Node-specific .ipfs
-        Path.cwd().parent / '.ipfs',  # Current working directory parent
+        Path.cwd() / '.ipfs',  # Current working directory
         Path.home() / '.ipfs',  # User home directory
     ]
 
@@ -1021,7 +1095,7 @@ def find_ipfs_directory(db_path: str) -> Optional[str]:
                 return str(ipfs_path)
 
     logger.warning(f"No valid .ipfs directory found for {db_path}")
-    logger.debug(f"  Searched from node dir: {node_dir}")
+    logger.debug(f"  Searched from: {db_path_obj.parent}")
     return None
 
 
@@ -1074,9 +1148,15 @@ def is_ipfs_daemon_running(ipfs_path: str) -> bool:
         return False
 
 
-def fetch_ipfs_data(token_id: str, ipfs_path: str, script_dir: str) -> Tuple[Optional[str], bool, Optional[str]]:
+def fetch_ipfs_data(token_id: str, ipfs_path: str, script_dir: str, ipfs_binary: str = None) -> Tuple[Optional[str], bool, Optional[str]]:
     """
     Fetch IPFS data for a token_id using ipfs cat with detailed logging.
+
+    Args:
+        token_id: Token ID to fetch from IPFS
+        ipfs_path: Path to .ipfs directory for IPFS_PATH environment variable
+        script_dir: Script directory for command execution
+        ipfs_binary: Path to IPFS binary (if None, uses global IPFS_COMMAND)
 
     Returns:
         (ipfs_data, success, error_message)
@@ -1113,9 +1193,12 @@ def fetch_ipfs_data(token_id: str, ipfs_path: str, script_dir: str) -> Tuple[Opt
 
             for lock_attempt in range(max_lock_retries):
                 try:
-                    # Run ipfs cat command using globally detected IPFS binary
+                    # Use per-node IPFS binary if provided, otherwise fall back to global
+                    ipfs_cmd = ipfs_binary if ipfs_binary else IPFS_COMMAND
+
+                    # Run ipfs cat command using node-specific or global IPFS binary
                     result = subprocess.run(
-                        [IPFS_COMMAND, 'cat', token_id],
+                        [ipfs_cmd, 'cat', token_id],
                         capture_output=True,
                         text=True,
                         timeout=IPFS_TIMEOUT,
@@ -1223,7 +1306,7 @@ def process_token_ipfs(args: Tuple) -> TokenRecord:
     Process a single token: fetch IPFS data and prepare record.
     This function is designed for parallel execution.
     """
-    (token_row, source_ip, node_name, db_path, ipfs_path, db_last_modified, script_dir) = args
+    (token_row, source_ip, node_name, db_path, ipfs_path, ipfs_binary, db_last_modified, script_dir) = args
 
     # Extract SQLite fields with safe handling
     did = safe_str(token_row[0])
@@ -1241,7 +1324,7 @@ def process_token_ipfs(args: Tuple) -> TokenRecord:
 
     if token_id and ipfs_path:
         for attempt in range(RETRY_ATTEMPTS):
-            ipfs_data, ipfs_fetched, ipfs_error = fetch_ipfs_data(token_id, ipfs_path, script_dir)
+            ipfs_data, ipfs_fetched, ipfs_error = fetch_ipfs_data(token_id, ipfs_path, script_dir, ipfs_binary)
             if ipfs_fetched or ipfs_error != "IPFS timeout":
                 break
             time.sleep(0.1 * (attempt + 1))  # Brief exponential backoff
@@ -1675,15 +1758,23 @@ def process_database_incremental(db_path: str, db_last_modified: float, source_i
         bool: True if processing completed successfully
     """
     try:
-        # Extract node name and get pre-mapped IPFS directory
+        # Extract node name and get pre-mapped IPFS directory and binary
         node_name = extract_node_name(db_path)
         ipfs_path = ipfs_mapping.get(db_path)
+
+        # Find IPFS binary for this specific node
+        ipfs_binary = find_node_ipfs_binary(db_path)
 
         logger.info(f"🔄 Starting incremental processing for {node_name}: {db_path}")
         if ipfs_path:
             logger.info(f"  📁 IPFS path: {ipfs_path}")
         else:
             logger.warning(f"  ⚠️  No IPFS path found for {node_name}")
+
+        if ipfs_binary:
+            logger.info(f"  🔧 IPFS binary: {ipfs_binary}")
+        else:
+            logger.warning(f"  ⚠️  No IPFS binary found for {node_name}, using global fallback")
 
         # Connect to SQLite database
         conn = sqlite3.connect(db_path)
@@ -1753,7 +1844,7 @@ def process_database_incremental(db_path: str, db_last_modified: float, source_i
             try:
                 # Prepare arguments for parallel processing of this batch
                 args_list = [
-                    (row, source_ip, node_name, db_path, ipfs_path, db_last_modified, script_dir)
+                    (row, source_ip, node_name, db_path, ipfs_path, ipfs_binary, db_last_modified, script_dir)
                     for row in batch_tokens
                 ]
 
@@ -1872,9 +1963,12 @@ def process_database(db_path: str, db_last_modified: float, source_ip: str, scri
         List of records ready for Azure SQL insertion
     """
     try:
-        # Extract node name and get pre-mapped IPFS directory
+        # Extract node name and get pre-mapped IPFS directory and binary
         node_name = extract_node_name(db_path)
         ipfs_path = ipfs_mapping.get(db_path)
+
+        # Find IPFS binary for this specific node
+        ipfs_binary = find_node_ipfs_binary(db_path)
 
         logger.info(f"Processing {node_name}: {db_path}")
         if ipfs_path:
@@ -1927,7 +2021,7 @@ def process_database(db_path: str, db_last_modified: float, source_ip: str, scri
 
         # Prepare arguments for parallel processing
         args_list = [
-            (row, source_ip, node_name, db_path, ipfs_path, db_last_modified, script_dir)
+            (row, source_ip, node_name, db_path, ipfs_path, ipfs_binary, db_last_modified, script_dir)
             for row in token_rows
         ]
 
