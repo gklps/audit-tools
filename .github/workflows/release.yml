@@ -64,23 +64,60 @@ jobs:
 
     - name: Install Python dependencies
       run: |
-        pip install pyodbc requests
+        python3 -m pip install --upgrade pip setuptools wheel
+        python3 -m pip install pyodbc requests pyinstaller psutil
 
     - name: Remove conflicting packages
       run: |
-        pip uninstall -y pathlib || true
+        python3 -m pip uninstall -y pathlib || true
+      shell: bash
+
+    - name: Debug - List available files
+      run: |
+        echo "=== Current directory contents ==="
+        ls -la
+        echo "=== Python version ==="
+        python3 --version
+        echo "=== PyInstaller version ==="
+        python3 -m PyInstaller --version
+        echo "=== Required files check ==="
+        for file in rubix_sync_main.py rubix_launcher.py config_manager.py system_checker.py sync_distributed_tokens.py rubix_sync.spec; do
+          if [ -f "$file" ]; then
+            echo "✅ $file exists"
+          else
+            echo "❌ $file missing"
+          fi
+        done
       shell: bash
 
     - name: Build executable
       run: |
-        python build_executable.py
+        echo "=== Starting build process ==="
+        python3 build_executable.py --install-deps
+      shell: bash
 
     - name: Test executable
       run: |
+        echo "=== Testing executable ==="
         if [ "${{ matrix.platform }}" = "windows" ]; then
-          ./dist/RubixTokenSync.exe --help
+          ls -la dist/
+          if [ -f "dist/RubixTokenSync.exe" ]; then
+            echo "✅ Windows executable found"
+            ./dist/RubixTokenSync.exe --help
+          else
+            echo "❌ Windows executable not found"
+            exit 1
+          fi
         else
-          ./dist/RubixTokenSync --help
+          ls -la dist/
+          if [ -f "dist/RubixTokenSync" ]; then
+            echo "✅ Unix executable found"
+            chmod +x dist/RubixTokenSync
+            ./dist/RubixTokenSync --help
+          else
+            echo "❌ Unix executable not found"
+            exit 1
+          fi
         fi
       shell: bash
 

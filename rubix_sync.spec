@@ -94,7 +94,6 @@ hidden_imports = [
     'json',
     'uuid',
     'datetime',
-    'pathlib',
     'threading',
     'multiprocessing',
     'multiprocessing.pool',
