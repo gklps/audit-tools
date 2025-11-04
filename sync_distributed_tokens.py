@@ -2934,69 +2934,21 @@ def main():
                         }
                     )
 
-                    # Use optimized bulk insert
-                    with OperationContext(f"INSERT_RECORDS_{len(records)}", 'SQL', sql_logger):
-                        if len(records) >= BULK_INSERT_SIZE:
-                            audit_logger.log_with_context(
-                                logger, logging.INFO, f"Using bulk insert for {len(records)} records",
-                                component='SQL', operation='BULK_INSERT_DECISION',
-                                extra_data={'record_count': len(records), 'threshold': BULK_INSERT_SIZE}
-                            )
-                            success_count, error_count = bulk_insert_records(records)
-                        else:
-                            # Process in batches
-                            success_count = 0
-                            error_count = 0
-                            batch_count = 0
-                            for batch_start in range(0, len(records), BATCH_SIZE):
-                                batch_end = min(batch_start + BATCH_SIZE, len(records))
-                                batch = records[batch_start:batch_end]
-                                batch_count += 1
-
-                                audit_logger.log_with_context(
-                                    logger, logging.DEBUG, f"Processing batch {batch_count}",
-                                    component='SQL', operation='BATCH_INSERT',
-                                    extra_data={
-                                        'batch_number': batch_count,
-                                        'batch_size': len(batch),
-                                        'batch_start': batch_start,
-                                        'batch_end': batch_end
-                                    }
-                                )
-
-                                batch_success, batch_errors = bulk_insert_records(batch)
-                                success_count += batch_success
-                                error_count += batch_errors
-
-                    # Update processing metadata
-                    processing_duration = time.time() - db_start_time
-                    update_processed_database(db_path, db_last_modified, len(records),
-                                            ipfs_success, ipfs_fail, validation_errors, processing_duration)
-
+                    # Database processing completed - all handled by incremental processing
                     sync_metrics.total_databases_processed += 1
 
-                    # Log database completion
-                    db_metrics = {
-                        'processing_duration': processing_duration,
-                        'records_processed': len(records),
-                        'success_count': success_count,
-                        'error_count': error_count,
-                        'ipfs_success_rate': (ipfs_success / len(records)) * 100,
-                        'database_index': idx
-                    }
-
+                else:
+                    # Incremental processing failed - log the issue
                     audit_logger.log_with_context(
-                        logger, logging.INFO, f"Database {Path(db_path).stem} processing completed",
-                        component='MAIN', operation='DATABASE_COMPLETED',
-                        extra_data=db_metrics
+                        logger, logging.ERROR,
+                        f"❌ Incremental processing failed for {extract_node_name(db_path)}",
+                        component='SYNC', operation='DATABASE_FAILED',
+                        extra_data={
+                            'database': db_path,
+                            'database_index': idx,
+                            'total_databases': len(databases_to_process)
+                        }
                     )
-
-                    # Send Telegram notification for significant databases
-                    if telegram_enabled:
-                        try:
-                            notify_database_completed(Path(db_path).stem, db_metrics)
-                        except Exception as e:
-                            logger.warning(f"Failed to send database completion notification: {e}")
 
                 audit_logger.end_operation()  # End database processing operation
 
