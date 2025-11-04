@@ -160,8 +160,16 @@ for module in optional_modules:
         python_sources.append(str(module_path))
 
 # Analysis phase - discover all dependencies
+# Include all core modules for proper bundling
+all_scripts = [main_script]
+for module in core_modules:
+    if module != main_script:  # Don't add main script twice
+        module_path = current_dir / module
+        if module_path.exists():
+            all_scripts.append(str(module_path))
+
 a = Analysis(
-    [main_script],
+    all_scripts,
     pathex=[str(current_dir)],
     binaries=[],
     datas=data_files,

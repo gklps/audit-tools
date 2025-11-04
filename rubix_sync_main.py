@@ -13,6 +13,10 @@ from pathlib import Path
 current_dir = Path(__file__).parent.absolute()
 sys.path.insert(0, str(current_dir))
 
+def is_bundled_executable() -> bool:
+    """Check if we're running as a PyInstaller bundled executable"""
+    return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
+
 def is_interactive_mode() -> bool:
     """Check if we should run in interactive mode"""
     # Run interactive mode if:
@@ -133,17 +137,19 @@ def check_basic_requirements():
     if sys.version_info < (3, 8):
         errors.append(f"Python 3.8+ required, found {sys.version_info.major}.{sys.version_info.minor}")
 
-    # Check for required files
-    required_files = [
-        "sync_distributed_tokens.py",
-        "rubix_launcher.py",
-        "config_manager.py",
-        "system_checker.py"
-    ]
+    # Only check for files when running as Python script, not as bundled executable
+    if not is_bundled_executable():
+        # Check for required files
+        required_files = [
+            "sync_distributed_tokens.py",
+            "rubix_launcher.py",
+            "config_manager.py",
+            "system_checker.py"
+        ]
 
-    for file in required_files:
-        if not (current_dir / file).exists():
-            errors.append(f"Required file missing: {file}")
+        for file in required_files:
+            if not (current_dir / file).exists():
+                errors.append(f"Required file missing: {file}")
 
     if errors:
         print("[ERROR] Requirements Check Failed:")
