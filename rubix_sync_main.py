@@ -9,40 +9,40 @@ import sys
 import subprocess
 from pathlib import Path
 
-def is_bundled_executable() -> bool:
-    """Check if we're running as a PyInstaller bundled executable"""
-    return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
-
 # Handle path correctly for both bundled and unbundled execution
-if is_bundled_executable():
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
     # When bundled, use current working directory for config files
-    # and PyInstaller's extraction path for modules
     current_dir = Path.cwd()
-    sys.path.insert(0, sys._MEIPASS)
 else:
     # When running as script, use file location
     current_dir = Path(__file__).parent.absolute()
     sys.path.insert(0, str(current_dir))
+
+def is_bundled_executable() -> bool:
+    """Check if we're running as a PyInstaller bundled executable"""
+    return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
 
 def is_interactive_mode() -> bool:
     """Check if we should run in interactive mode"""
     # Run interactive mode if:
     # 1. No command line arguments provided
     # 2. Explicitly requested with --interactive
-    # 3. Not help mode
+    # 3. Running as compiled executable with no args
+
+    if len(sys.argv) == 1:
+        return True
 
     if "--interactive" in sys.argv:
         return True
 
-    if is_help_mode():
-        return False
+    # Check if running as compiled executable (PyInstaller)
+    if hasattr(sys, 'frozen') and len(sys.argv) == 1:
+        return True
 
-    # If no meaningful arguments provided, default to interactive
-    meaningful_args = [arg for arg in sys.argv[1:] if not arg.startswith('--')]
-    return len(meaningful_args) == 0
+    return False
 
-def is_help_mode() -> bool:
-    """Check if help is requested"""
+def should_show_help() -> bool:
+    """Check if help should be displayed"""
     help_args = ["--help", "-h", "help"]
     return any(arg in sys.argv for arg in help_args)
 
@@ -82,13 +82,13 @@ def show_usage():
     print("  rubix_sync_main.py --test-only           # Test connections only")
     print()
     print("FEATURES:")
-    print("  [IPFS] Per-node IPFS detection (automatic binary discovery)")
+    print("  [IPFS]  Per-node IPFS detection (automatic binary discovery)")
     print("  [DATA] SQLite schema compatibility (handles missing columns)")
     print("  [SYNC] Universal IPFS binary detection")
-    print("  [DB]   Azure SQL Database integration")
+    print("  [DB]  Azure SQL Database integration")
     print("  [TELEGRAM] Real-time Telegram notifications")
     print("  [DATA] Comprehensive audit logging")
-    print("  [PLATFORM] Cross-platform compatibility (Windows/macOS/Linux)")
+    print("  [PLATFORM]  Cross-platform compatibility (Windows/macOS/Linux)")
     print()
     print("CONFIGURATION:")
     print("  Configuration files are automatically created in the current directory:")
@@ -96,7 +96,6 @@ def show_usage():
     print("  • telegram_config.json      - Notification settings")
     print()
     print("  Use interactive mode to set up credentials with guided prompts.")
-    print()
 
 def run_interactive_launcher():
     """Run the interactive launcher"""
@@ -115,6 +114,12 @@ def run_interactive_launcher():
 def run_direct_sync():
     """Run direct sync with command-line arguments"""
     try:
+        # Import and run the main sync function
+        sys.path.insert(0, str(current_dir))
+
+        # Remove our entry point from argv to pass clean args to sync script
+        original_argv = sys.argv[:]
+
         # Call the main sync script directly
         from sync_distributed_tokens import main as sync_main
 
@@ -157,22 +162,28 @@ def check_basic_requirements():
             print(f"   • {error}")
         print()
         print("Please ensure all required files are present and Python 3.8+ is installed.")
-        return False
-
-    return True
-
-def main():
-    """Main entry point"""
-    # Check requirements first
-    if not check_basic_requirements():
         sys.exit(1)
 
-    if is_help_mode():
+def main():
+    """Main entry point for Rubix Token Sync"""
+
+    # Show help if requested (before any directory operations)
+    if should_show_help():
         show_usage()
         return
 
+    # Set working directory to script directory (only for unbundled mode)
+    if not is_bundled_executable():
+        os.chdir(current_dir)
+
+    # Check basic requirements
+    check_basic_requirements()
+
+    # Determine mode and run appropriate function
     if is_interactive_mode():
         print("[START] Starting Rubix Token Sync - Interactive Mode")
+        print("Use --help for command-line options")
+        print()
         run_interactive_launcher()
     else:
         print("[START] Starting Rubix Token Sync - Direct Mode")

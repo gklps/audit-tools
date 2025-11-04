@@ -14,18 +14,9 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 import getpass
 
-def is_bundled_executable() -> bool:
-    """Check if we're running as a PyInstaller bundled executable"""
-    return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
-
-# Handle path correctly for both bundled and unbundled execution
-if is_bundled_executable():
-    # When bundled, config files should be in current working directory
-    current_dir = Path.cwd()
-else:
-    # When running as script, use file location
-    current_dir = Path(__file__).parent.absolute()
-    sys.path.insert(0, str(current_dir))
+# Add current directory to Python path for imports
+current_dir = Path(__file__).parent.absolute()
+sys.path.insert(0, str(current_dir))
 
 class RubixLauncher:
     """Interactive launcher for Rubix Token Sync"""
@@ -66,9 +57,101 @@ class RubixLauncher:
 
     def print_header(self):
         """Print application header"""
+        print("=" * 60)
         print("[RUBIX] Rubix Token Sync Tool")
-        print("=" * 50)
+        print("Cross-Platform Distributed Token Synchronization")
+        print("=" * 60)
         print()
+
+    def print_status(self, message: str, level: str = "INFO"):
+        """Print colored status message"""
+        colors = {
+            "INFO": "\033[0;34m",     # Blue
+            "SUCCESS": "\033[0;32m",  # Green
+            "WARNING": "\033[1;33m",  # Yellow
+            "ERROR": "\033[0;31m",    # Red
+            "RESET": "\033[0m"        # Reset
+        }
+
+        color = colors.get(level, colors["INFO"])
+        reset = colors["RESET"]
+        print(f"{color}[{level}]{reset} {message}")
+
+    def check_azure_sql_config(self) -> bool:
+        """Check if Azure SQL configuration exists and is valid"""
+        if not self.azure_config_file.exists():
+            return False
+
+        try:
+            with open(self.azure_config_file, 'r') as f:
+                config_content = f.read().strip()
+
+            # Check if it's still using template placeholder
+            if "{your_password}" in config_content:
+                return False
+
+            # Basic validation - should contain required components
+            required_parts = ["Server=", "Database=", "UID=", "PWD="]
+            return all(part in config_content for part in required_parts)
+
+        except Exception:
+            return False
+
+    def check_telegram_config(self) -> bool:
+        """Check if Telegram configuration exists and is valid"""
+        if not self.telegram_config_file.exists():
+            return False
+
+        try:
+            with open(self.telegram_config_file, 'r') as f:
+                config = json.load(f)
+
+            # Check if required fields exist
+            required_fields = ["bot_token", "chat_id", "enabled"]
+            return all(field in config for field in required_fields)
+
+        except Exception:
+            return False
+
+    def test_azure_sql_connection(self) -> bool:
+        """Test Azure SQL Database connection"""
+        if not self.check_azure_sql_config():
+            return False
+
+        try:
+            # Import and test connection
+            from sync_distributed_tokens import get_azure_sql_connection_string, init_connection_pool
+
+            conn_string = get_azure_sql_connection_string()
+            if "{your_password}" in conn_string:
+                return False
+
+            pool = init_connection_pool()
+            conn = pool.get_connection()
+            conn.close()
+            return True
+
+        except Exception as e:
+            self.print_status(f"Azure SQL connection failed: {e}", "ERROR")
+            return False
+
+    def test_telegram_connection(self) -> bool:
+        """Test Telegram connection"""
+        if not self.check_telegram_config():
+            return False
+
+        try:
+            # Import and test Telegram
+            from telegram_notifier import init_telegram_notifier
+
+            notifier = init_telegram_notifier()
+            if notifier and notifier.config.enabled:
+                return notifier.test_connection()
+            return False
+
+        except Exception as e:
+            self.print_status(f"Telegram connection failed: {e}", "ERROR")
+            return False
 
     def show_system_info(self):
         """Display system information"""
@@ -76,10 +159,10 @@ class RubixLauncher:
         self.print_header()
 
         print("[SYSTEM] System Information:")
-        print(f"   [HOST] Hostname: {platform.node()}")
-        print(f"   [INFO] System: {platform.system()} {platform.release()}")
-        print(f"   [ARCH] Architecture: {platform.machine()}")
-        print(f"   Python Version: {sys.version}")
+        print(f"   [HOST]  Hostname: {platform.node()}")
+        print(f"   [INFO]  System: {platform.system()} {platform.release()}")
+        print(f"   [ARCH]  Architecture: {platform.machine()}")
+        print(f"   🐍 Python Version: {sys.version.split()[0]}")
         print(f"   [DIR] Working Directory: {current_dir}")
 
         # Check disk space
@@ -91,27 +174,37 @@ class RubixLauncher:
         except:
             print(f"   [DISK] Available Disk Space: Unable to detect")
 
+        # Check memory
+        try:
+            if platform.system() == "Linux":
+                with open('/proc/meminfo', 'r') as f:
+                    meminfo = f.read()
+                    for line in meminfo.split('\n'):
+                        if 'MemAvailable:' in line:
+                            mem_kb = int(line.split()[1])
+                            mem_gb = mem_kb // (1024**2)
+                            print(f"   🧠 Available Memory: {mem_gb} GB")
+                            break
+            else:
+                print(f"   🧠 Available Memory: System dependent")
+        except:
+            print(f"   🧠 Available Memory: Unable to detect")
+
+        print(f"   🕐 Current Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         print()
 
-        # Check configuration status
-        self.show_configuration_status()
-
-        print()
-        input("Press Enter to continue...")
-
-    def show_configuration_status(self) -> bool:
-        """Show current configuration status and return True if all configured"""
-        print("[CONFIG] Configuration Status:")
+        # Show configuration status
+        print("[CONFIG]  Configuration Status:")
         azure_status = "[OK] Configured" if self.check_azure_sql_config() else "[ERROR] Not configured"
         telegram_status = "[OK] Configured" if self.check_telegram_config() else "[ERROR] Not configured"
-
-        print(f"   [DB] Azure SQL Database: {azure_status}")
+        print(f"   [DB]  Azure SQL Database: {azure_status}")
         print(f"   [TELEGRAM] Telegram Notifications: {telegram_status}")
+        print()
 
-        return self.check_azure_sql_config() and self.check_telegram_config()
+        input("Press Enter to continue...")
 
-    def setup_azure_sql(self):
-        """Setup Azure SQL Database configuration"""
+    def setup_azure_sql_credentials(self):
+        """Interactive setup for Azure SQL credentials"""
         self.clear_screen()
         self.print_header()
 
@@ -119,90 +212,105 @@ class RubixLauncher:
         print("-" * 40)
         print()
 
-        if self.azure_config_file.exists():
-            print("[WARNING] Existing Azure SQL configuration found.")
-            choice = input("Do you want to overwrite it? (y/N): ").strip().lower()
-            if choice != 'y':
-                return
+        # Check if config already exists
+        if self.check_azure_sql_config():
+            print("[WARNING]  Existing Azure SQL configuration found.")
 
-        print("Please provide your Azure SQL Database details:")
+            # Show current configuration (masked)
+            try:
+                with open(self.azure_config_file, 'r') as f:
+                    config_content = f.read().strip()
+
+                # Extract server and database for display
+                server = "Unknown"
+                database = "Unknown"
+                user = "Unknown"
+
+                for part in config_content.split(';'):
+                    if part.startswith('SERVER='):
+                        server = part.split('=', 1)[1]
+                    elif part.startswith('DATABASE='):
+                        database = part.split('=', 1)[1]
+                    elif part.startswith('UID='):
+                        user = part.split('=', 1)[1]
+
+                print(f"Current settings:")
+                print(f"   Server: {server}")
+                print(f"   Database: {database}")
+                print(f"   Username: {user}")
+                print(f"   Password: ********")
+                print()
+
+                choice = input("Keep existing configuration? (y/n) [y]: ").strip().lower()
+                if choice in ['', 'y', 'yes']:
+                    self.print_status("Keeping existing configuration", "SUCCESS")
+                    time.sleep(1)
+                    return
+
+            except Exception:
+                pass
+
+        # Get new configuration
+        print("Enter Azure SQL Database details:")
         print()
 
-        # Get database connection details
-        server = input("Server (e.g., myserver.database.windows.net): ").strip()
-        if not server:
-            print("[ERROR] Server is required!")
-            input("Press Enter to continue...")
-            return
+        # Default values
+        default_server = "rauditser.database.windows.net,1433"
+        default_database = "rauditd"
+        default_user = "rubix"
 
-        database = input("Database name: ").strip()
-        if not database:
-            print("[ERROR] Database name is required!")
-            input("Press Enter to continue...")
-            return
+        server = input(f"Server [{default_server}]: ").strip() or default_server
+        database = input(f"Database [{default_database}]: ").strip() or default_database
+        user = input(f"Username [{default_user}]: ").strip() or default_user
 
-        username = input("Username: ").strip()
-        if not username:
-            print("[ERROR] Username is required!")
-            input("Press Enter to continue...")
-            return
+        # Get password securely
+        while True:
+            password = getpass.getpass("Password: ").strip()
+            if password:
+                confirm_password = getpass.getpass("Confirm password: ").strip()
+                if password == confirm_password:
+                    break
+                else:
+                    self.print_status("Passwords don't match. Please try again.", "ERROR")
+            else:
+                self.print_status("Password cannot be empty.", "ERROR")
 
-        password = getpass.getpass("Password: ")
-        if not password:
-            print("[ERROR] Password is required!")
-            input("Press Enter to continue...")
-            return
-
-        # Choose driver
-        print("\nAvailable ODBC drivers:")
-        print("1. ODBC Driver 17 for SQL Server (recommended)")
-        print("2. ODBC Driver 18 for SQL Server")
-        print("3. SQL Server Native Client 11.0")
-
-        driver_choice = input("Choose driver (1-3) [1]: ").strip() or "1"
-
-        drivers = {
-            "1": "ODBC Driver 17 for SQL Server",
-            "2": "ODBC Driver 18 for SQL Server",
-            "3": "SQL Server Native Client 11.0"
-        }
-
-        driver = drivers.get(driver_choice, drivers["1"])
-
-        # Create connection string
+        # Build connection string
         connection_string = (
-            f"DRIVER={{{driver}}};"
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
             f"SERVER={server};"
             f"DATABASE={database};"
-            f"UID={username};"
+            f"UID={user};"
             f"PWD={password};"
             f"Encrypt=yes;"
             f"TrustServerCertificate=no;"
             f"Connection Timeout=30;"
         )
 
-        # Save configuration
+        # Test connection
+        print()
+        self.print_status("Testing database connection...", "INFO")
+
+        # Save temporarily to test
         try:
             with open(self.azure_config_file, 'w') as f:
                 f.write(connection_string)
 
-            print(f"\n[OK] Azure SQL configuration saved to {self.azure_config_file}")
-
-            # Test connection
-            print("\nTesting connection...")
-            if self.test_azure_connection():
-                print("[OK] Connection test successful!")
+            if self.test_azure_sql_connection():
+                self.print_status("[OK] Database connection successful!", "SUCCESS")
+                print()
+                input("Press Enter to continue...")
             else:
-                print("[ERROR] Connection test failed. Please check your credentials.")
+                self.print_status("[ERROR] Database connection failed!", "ERROR")
+                print("Please check your credentials and try again.")
+                input("Press Enter to continue...")
 
         except Exception as e:
-            print(f"[ERROR] Failed to save configuration: {e}")
+            self.print_status(f"Error saving configuration: {e}", "ERROR")
+            input("Press Enter to continue...")
 
-        print()
-        input("Press Enter to continue...")
-
-    def setup_telegram(self):
-        """Setup Telegram configuration"""
+    def setup_telegram_config(self):
+        """Setup Telegram configuration (pre-configured)"""
         self.clear_screen()
         self.print_header()
 
@@ -210,132 +318,171 @@ class RubixLauncher:
         print("-" * 40)
         print()
 
-        if self.telegram_config_file.exists():
-            print("[WARNING] Existing Telegram configuration found.")
-            choice = input("Do you want to overwrite it? (y/N): ").strip().lower()
-            if choice != 'y':
-                return
+        if self.check_telegram_config():
+            print("[OK] Telegram is already configured.")
 
-        print("Telegram bot is pre-configured with audit bot credentials.")
-        print("You can customize the machine name and notification preferences.")
+            try:
+                with open(self.telegram_config_file, 'r') as f:
+                    config = json.load(f)
+
+                print(f"Current settings:")
+                print(f"   Machine Name: {config.get('machine_name', 'Unknown')}")
+                print(f"   Notifications: {'Enabled' if config.get('enabled', False) else 'Disabled'}")
+                print(f"   Bot Token: {config.get('bot_token', 'Unknown')[:20]}...")
+                print(f"   Chat ID: {config.get('chat_id', 'Unknown')}")
+                print()
+
+                choice = input("Keep existing configuration? (y/n) [y]: ").strip().lower()
+                if choice in ['', 'y', 'yes']:
+                    self.print_status("Keeping existing configuration", "SUCCESS")
+                    time.sleep(1)
+                    return
+
+            except Exception:
+                pass
+
+        # Setup new configuration
+        print("Setting up Telegram notifications...")
+        print("[TELEGRAM] Bot Token and Chat ID are pre-configured.")
         print()
 
         # Get machine name
-        default_name = self.get_machine_name()
-        machine_name = input(f"Machine name [{default_name}]: ").strip() or default_name
-
-        # Get notification preferences
-        print("\nNotification preferences:")
-        send_startup = input("Send startup notifications? (Y/n): ").strip().lower() != 'n'
-        send_progress = input("Send progress updates? (Y/n): ").strip().lower() != 'n'
-        send_errors = input("Send error notifications? (Y/n): ").strip().lower() != 'n'
-        send_completion = input("Send completion notifications? (Y/n): ").strip().lower() != 'n'
-
-        if send_progress:
-            try:
-                interval = int(input("Progress update interval in seconds [300]: ").strip() or "300")
-            except ValueError:
-                interval = 300
-        else:
-            interval = 300
+        default_machine_name = self.get_machine_name()
+        machine_name = input(f"Machine Name [{default_machine_name}]: ").strip() or default_machine_name
 
         # Create configuration
         config = self.default_telegram_config.copy()
-        config.update({
-            "machine_name": machine_name,
-            "send_startup": send_startup,
-            "send_progress": send_progress,
-            "send_errors": send_errors,
-            "send_completion": send_completion,
-            "progress_interval": interval
-        })
+        config["machine_name"] = machine_name
 
         # Save configuration
         try:
             with open(self.telegram_config_file, 'w') as f:
                 json.dump(config, f, indent=2)
 
-            print(f"\n[OK] Telegram configuration saved to {self.telegram_config_file}")
+            self.print_status("[OK] Telegram configuration saved!", "SUCCESS")
+
+            # Test connection
+            print()
+            self.print_status("Testing Telegram connection...", "INFO")
+
+            if self.test_telegram_connection():
+                self.print_status("[OK] Telegram connection successful!", "SUCCESS")
+            else:
+                self.print_status("[WARNING]  Telegram connection test failed", "WARNING")
+                print("Configuration saved but connection could not be verified.")
+
+            print()
+            input("Press Enter to continue...")
 
         except Exception as e:
-            print(f"[ERROR] Failed to save configuration: {e}")
+            self.print_status(f"Error saving Telegram configuration: {e}", "ERROR")
+            input("Press Enter to continue...")
+
+    def test_connections(self):
+        """Test all connections"""
+        self.clear_screen()
+        self.print_header()
+
+        print("🧪 Connection Tests")
+        print("-" * 40)
+        print()
+
+        # Test Azure SQL
+        self.print_status("Testing Azure SQL Database connection...", "INFO")
+        if self.test_azure_sql_connection():
+            self.print_status("[OK] Azure SQL Database: Connected", "SUCCESS")
+        else:
+            self.print_status("[ERROR] Azure SQL Database: Failed", "ERROR")
+
+        print()
+
+        # Test Telegram
+        self.print_status("Testing Telegram connection...", "INFO")
+        if self.test_telegram_connection():
+            self.print_status("[OK] Telegram: Connected", "SUCCESS")
+        else:
+            self.print_status("[ERROR] Telegram: Failed", "ERROR")
 
         print()
         input("Press Enter to continue...")
 
-    def check_azure_sql_config(self) -> bool:
-        """Check if Azure SQL is configured"""
-        return self.azure_config_file.exists()
+    def show_configuration_status(self):
+        """Show current configuration status"""
+        azure_configured = self.check_azure_sql_config()
+        telegram_configured = self.check_telegram_config()
 
-    def check_telegram_config(self) -> bool:
-        """Check if Telegram is configured"""
-        return self.telegram_config_file.exists()
+        print("Current Configuration:")
+        if azure_configured:
+            print("[OK] MSSQL: Configured")
+            if self.test_azure_sql_connection():
+                print("   🔗 Connection: Working")
+            else:
+                print("   [WARNING]  Connection: Failed")
+        else:
+            print("[ERROR] MSSQL: Not configured")
 
-    def test_azure_connection(self) -> bool:
-        """Test Azure SQL connection"""
-        if not self.azure_config_file.exists():
-            return False
+        if telegram_configured:
+            print("[OK] Telegram: Configured")
+            if self.test_telegram_connection():
+                print("   🔗 Connection: Working")
+            else:
+                print("   [WARNING]  Connection: Failed")
+        else:
+            print("[ERROR] Telegram: Not configured")
 
-        try:
-            import pyodbc
-            with open(self.azure_config_file, 'r') as f:
-                connection_string = f.read().strip()
+        print()
+        return azure_configured and telegram_configured
 
-            conn = pyodbc.connect(connection_string)
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1")
-            cursor.fetchone()
-            conn.close()
-            return True
-
-        except Exception:
-            return False
-
-    def run_sync(self, sync_type: str):
-        """Run synchronization with specified type"""
+    def run_sync(self, sync_type: str = "standard"):
+        """Run the sync process"""
         self.clear_screen()
         self.print_header()
 
-        print(f"Starting {sync_type}...")
+        print(f"[RUBIX] Running {sync_type.title()} Sync")
         print("-" * 40)
         print()
 
-        # Check configuration
+        # Check prerequisites
         if not self.check_azure_sql_config():
-            print("[ERROR] Azure SQL Database not configured!")
-            print("Please configure database settings first.")
+            self.print_status("[ERROR] Azure SQL Database not configured!", "ERROR")
+            print("Please configure database credentials first.")
             input("Press Enter to continue...")
             return
 
+        # Ensure Telegram is configured
+        if not self.check_telegram_config():
+            self.print_status("Setting up Telegram configuration...", "INFO")
+            try:
+                with open(self.telegram_config_file, 'w') as f:
+                    json.dump(self.default_telegram_config, f, indent=2)
+                self.print_status("[OK] Telegram configured with default settings", "SUCCESS")
+            except Exception as e:
+                self.print_status(f"Warning: Could not setup Telegram: {e}", "WARNING")
+
+        # Build sync command
+        sync_cmd = [sys.executable, "sync_distributed_tokens.py"]
+
+        if sync_type == "full":
+            sync_cmd.extend(["--clear", "--force-ipfs"])
+        elif sync_type == "cleanup":
+            sync_cmd.append("--cleanup-locks")
+        elif sync_type == "essential":
+            sync_cmd.append("--essential-only")
+
+        self.print_status(f"Executing: {' '.join(sync_cmd)}", "INFO")
+        print()
+
+        # Run the sync
         try:
-            # Import and run sync
-            from sync_distributed_tokens import main as sync_main
+            result = subprocess.run(sync_cmd, cwd=current_dir)
 
-            # Set command line arguments based on sync type
-            original_argv = sys.argv[:]
-
-            if sync_type == "Standard Sync":
-                sys.argv = ["rubix_sync"]
-            elif sync_type == "Full Sync":
-                sys.argv = ["rubix_sync", "--clear", "--force-ipfs"]
-            elif sync_type == "Test Connections":
-                sys.argv = ["rubix_sync", "--test-only"]
-            elif sync_type == "Cleanup IPFS Locks":
-                sys.argv = ["rubix_sync", "--cleanup-locks"]
-            elif sync_type == "Essential Metadata":
-                sys.argv = ["rubix_sync", "--essential-only"]
-
-            # Run sync
-            sync_main()
-
-            # Restore original argv
-            sys.argv = original_argv
-
-            print()
-            print("[OK] Sync completed successfully!")
+            if result.returncode == 0:
+                self.print_status("[OK] Sync completed successfully!", "SUCCESS")
+            else:
+                self.print_status(f"[ERROR] Sync failed with exit code {result.returncode}", "ERROR")
 
         except Exception as e:
-            print(f"[ERROR] Sync failed: {e}")
+            self.print_status(f"[ERROR] Error running sync: {e}", "ERROR")
 
         print()
         input("Press Enter to continue...")
@@ -346,9 +493,9 @@ class RubixLauncher:
             self.clear_screen()
             self.print_header()
 
+            # Show configuration status
             all_configured = self.show_configuration_status()
 
-            print()
             print("Choose an option:")
             print("1. Run Standard Sync (incremental)")
             print("2. Run Full Sync (clear all + resync)")
@@ -361,37 +508,80 @@ class RubixLauncher:
             print("9. Exit")
             print()
 
-            choice = input("Enter choice [1-9]: ").strip()
+            if not all_configured:
+                self.print_status("[WARNING]  Some configurations are missing. Please setup credentials first.", "WARNING")
+                print()
 
-            if choice == "1":
-                self.run_sync("Standard Sync")
-            elif choice == "2":
-                self.run_sync("Full Sync")
-            elif choice == "3":
-                self.run_sync("Test Connections")
-            elif choice == "4":
-                self.setup_azure_sql()
-            elif choice == "5":
-                self.setup_telegram()
-            elif choice == "6":
-                self.run_sync("Cleanup IPFS Locks")
-            elif choice == "7":
-                self.run_sync("Essential Metadata")
-            elif choice == "8":
-                self.show_system_info()
-            elif choice == "9":
-                print("\n[EXIT] Goodbye!")
+            try:
+                choice = input("Enter choice [1-9]: ").strip()
+
+                if choice == "1":
+                    self.run_sync("standard")
+                elif choice == "2":
+                    print()
+                    confirm = input("[WARNING]  This will delete ALL existing records. Type 'YES' to confirm: ").strip()
+                    if confirm == "YES":
+                        self.run_sync("full")
+                    else:
+                        self.print_status("Full sync cancelled.", "INFO")
+                        time.sleep(1)
+                elif choice == "3":
+                    self.test_connections()
+                elif choice == "4":
+                    self.setup_azure_sql_credentials()
+                elif choice == "5":
+                    self.setup_telegram_config()
+                elif choice == "6":
+                    self.run_sync("cleanup")
+                elif choice == "7":
+                    self.run_sync("essential")
+                elif choice == "8":
+                    self.show_system_info()
+                elif choice == "9":
+                    self.print_status("Goodbye! 👋", "SUCCESS")
+                    break
+                else:
+                    self.print_status("Invalid choice. Please try again.", "ERROR")
+                    time.sleep(1)
+
+            except KeyboardInterrupt:
+                print("\n")
+                self.print_status("Goodbye! 👋", "SUCCESS")
                 break
-            else:
-                print("\n[ERROR] Invalid choice. Please try again.")
-                time.sleep(1)
+            except Exception as e:
+                self.print_status(f"Error: {e}", "ERROR")
+                time.sleep(2)
+
+def main():
+    """Main entry point"""
+    launcher = RubixLauncher()
+
+    # Handle command line arguments for backward compatibility
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        if arg == "--clear":
+            launcher.run_sync("full")
+        elif arg == "--cleanup-locks":
+            launcher.run_sync("cleanup")
+        elif arg == "--essential-only":
+            launcher.run_sync("essential")
+        elif arg == "--test-only":
+            launcher.test_connections()
+        elif arg == "--help":
+            print("Rubix Token Sync Tool")
+            print("Usage: rubix_launcher.py [option]")
+            print("Options:")
+            print("  --clear          Full sync (clear all + resync)")
+            print("  --cleanup-locks  Cleanup IPFS lock errors")
+            print("  --essential-only Essential metadata only")
+            print("  --test-only      Test connections only")
+            print("  --help           Show this help")
+            print("  (no args)        Interactive menu")
+        else:
+            launcher.run_sync("standard")
+    else:
+        # Interactive mode
+        launcher.show_main_menu()
 
 if __name__ == "__main__":
-    try:
-        launcher = RubixLauncher()
-        launcher.show_main_menu()
-    except KeyboardInterrupt:
-        print("\n[EXIT] Goodbye!")
-    except Exception as e:
-        print(f"\n[ERROR] Launcher failed: {e}")
-        sys.exit(1)
+    main()
