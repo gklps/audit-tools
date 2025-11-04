@@ -14,9 +14,18 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 import getpass
 
-# Add current directory to Python path for imports
-current_dir = Path(__file__).parent.absolute()
-sys.path.insert(0, str(current_dir))
+# Handle path correctly for both bundled and unbundled execution
+def is_bundled_executable() -> bool:
+    """Check if we're running as a PyInstaller bundled executable"""
+    return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
+
+if is_bundled_executable():
+    # When bundled, config files should be in current working directory
+    current_dir = Path.cwd()
+else:
+    # When running as script, use file location
+    current_dir = Path(__file__).parent.absolute()
+    sys.path.insert(0, str(current_dir))
 
 class RubixLauncher:
     """Interactive launcher for Rubix Token Sync"""

@@ -9,13 +9,18 @@ import sys
 import subprocess
 from pathlib import Path
 
-# Add current directory to Python path
-current_dir = Path(__file__).parent.absolute()
-sys.path.insert(0, str(current_dir))
-
 def is_bundled_executable() -> bool:
     """Check if we're running as a PyInstaller bundled executable"""
     return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
+
+# Handle path correctly for both bundled and unbundled execution
+if is_bundled_executable():
+    # When bundled, use PyInstaller's temporary extraction path
+    current_dir = Path(sys._MEIPASS)
+else:
+    # When running as script, use file location
+    current_dir = Path(__file__).parent.absolute()
+    sys.path.insert(0, str(current_dir))
 
 def is_interactive_mode() -> bool:
     """Check if we should run in interactive mode"""
