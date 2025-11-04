@@ -75,7 +75,7 @@ class ExecutableBuilder:
         for module in required_modules:
             try:
                 __import__(module)
-                self.print_status(f"✅ {module} available", "SUCCESS")
+                self.print_status(f"[OK] {module} available", "SUCCESS")
             except ImportError:
                 errors.append(f"Required module missing: {module}")
 
@@ -92,17 +92,17 @@ class ExecutableBuilder:
         for file in required_files:
             file_path = self.current_dir / file
             if file_path.exists():
-                self.print_status(f"✅ {file} found", "SUCCESS")
+                self.print_status(f"[OK] {file} found", "SUCCESS")
             else:
                 errors.append(f"Required file missing: {file}")
 
         if errors:
             self.print_status("Prerequisites check failed:", "ERROR")
             for error in errors:
-                print(f"   ❌ {error}")
+                print(f"   [ERROR] {error}")
             return False
 
-        self.print_status("✅ All prerequisites satisfied", "SUCCESS")
+        self.print_status("[OK] All prerequisites satisfied", "SUCCESS")
         return True
 
     def clean_build_directories(self):
@@ -134,9 +134,9 @@ class ExecutableBuilder:
             try:
                 subprocess.run([sys.executable, "-m", "pip", "install", dep],
                              check=True, capture_output=True)
-                self.print_status(f"✅ Installed {dep}", "SUCCESS")
+                self.print_status(f"[OK] Installed {dep}", "SUCCESS")
             except subprocess.CalledProcessError as e:
-                self.print_status(f"❌ Failed to install {dep}: {e}", "ERROR")
+                self.print_status(f"[ERROR] Failed to install {dep}: {e}", "ERROR")
                 return False
 
         return True
@@ -163,19 +163,19 @@ class ExecutableBuilder:
             process = subprocess.run(cmd, cwd=self.current_dir, capture_output=True, text=True)
 
             if process.returncode == 0:
-                self.print_status("✅ Build completed successfully!", "SUCCESS")
+                self.print_status("[OK] Build completed successfully!", "SUCCESS")
 
                 # Check if executable was created
                 executable_path = self.dist_dir / self.executable_name
                 if executable_path.exists():
                     file_size = executable_path.stat().st_size / (1024 * 1024)  # MB
-                    self.print_status(f"✅ Executable created: {executable_path} ({file_size:.1f} MB)", "SUCCESS")
+                    self.print_status(f"[OK] Executable created: {executable_path} ({file_size:.1f} MB)", "SUCCESS")
                     return True
                 else:
-                    self.print_status(f"❌ Executable not found at {executable_path}", "ERROR")
+                    self.print_status(f"[ERROR] Executable not found at {executable_path}", "ERROR")
                     return False
             else:
-                self.print_status("❌ Build failed!", "ERROR")
+                self.print_status("[ERROR] Build failed!", "ERROR")
                 if process.stderr:
                     print("STDERR:")
                     print(process.stderr)
@@ -185,7 +185,7 @@ class ExecutableBuilder:
                 return False
 
         except Exception as e:
-            self.print_status(f"❌ Build error: {e}", "ERROR")
+            self.print_status(f"[ERROR] Build error: {e}", "ERROR")
             return False
 
     def test_executable(self) -> bool:
@@ -193,7 +193,7 @@ class ExecutableBuilder:
         executable_path = self.dist_dir / self.executable_name
 
         if not executable_path.exists():
-            self.print_status("❌ Executable not found for testing", "ERROR")
+            self.print_status("[ERROR] Executable not found for testing", "ERROR")
             return False
 
         self.print_status("Testing executable...")
@@ -204,19 +204,19 @@ class ExecutableBuilder:
                                   capture_output=True, text=True, timeout=30)
 
             if result.returncode == 0 and "Rubix Token Sync Tool" in result.stdout:
-                self.print_status("✅ Executable help test passed", "SUCCESS")
+                self.print_status("[OK] Executable help test passed", "SUCCESS")
             else:
-                self.print_status("❌ Executable help test failed", "ERROR")
+                self.print_status("[ERROR] Executable help test failed", "ERROR")
                 print(f"Return code: {result.returncode}")
                 print(f"STDOUT: {result.stdout}")
                 print(f"STDERR: {result.stderr}")
                 return False
 
         except subprocess.TimeoutExpired:
-            self.print_status("❌ Executable test timed out", "ERROR")
+            self.print_status("[ERROR] Executable test timed out", "ERROR")
             return False
         except Exception as e:
-            self.print_status(f"❌ Executable test error: {e}", "ERROR")
+            self.print_status(f"[ERROR] Executable test error: {e}", "ERROR")
             return False
 
         return True
@@ -226,7 +226,7 @@ class ExecutableBuilder:
         executable_path = self.dist_dir / self.executable_name
 
         if not executable_path.exists():
-            self.print_status("❌ Executable not found for packaging", "ERROR")
+            self.print_status("[ERROR] Executable not found for packaging", "ERROR")
             return False
 
         self.print_status("Creating distribution package...")
@@ -320,14 +320,14 @@ Platform: {self.platform_system} {self.platform_arch}
 
             if archive_path.exists():
                 archive_size = archive_path.stat().st_size / (1024 * 1024)  # MB
-                self.print_status(f"✅ Distribution package created: {archive_path} ({archive_size:.1f} MB)", "SUCCESS")
+                self.print_status(f"[OK] Distribution package created: {archive_path} ({archive_size:.1f} MB)", "SUCCESS")
                 return True
             else:
-                self.print_status("❌ Failed to create distribution package", "ERROR")
+                self.print_status("[ERROR] Failed to create distribution package", "ERROR")
                 return False
 
         except Exception as e:
-            self.print_status(f"❌ Error creating distribution package: {e}", "ERROR")
+            self.print_status(f"[ERROR] Error creating distribution package: {e}", "ERROR")
             return False
 
     def show_build_summary(self):
@@ -341,9 +341,9 @@ Platform: {self.platform_system} {self.platform_arch}
             for item in self.dist_dir.iterdir():
                 if item.is_file():
                     size = item.stat().st_size / (1024 * 1024)  # MB
-                    print(f"  📄 {item.name} ({size:.1f} MB)")
+                    print(f"  [FILE] {item.name} ({size:.1f} MB)")
                 elif item.is_dir():
-                    print(f"  📁 {item.name}/")
+                    print(f"  [DIR] {item.name}/")
 
         print()
         print("To distribute the executable:")
@@ -356,7 +356,7 @@ def main():
     """Main build script"""
     builder = ExecutableBuilder()
 
-    print("🏗️  Rubix Token Sync - Executable Builder")
+    print("[BUILD] Rubix Token Sync - Executable Builder")
     print("=" * 50)
     print()
 
@@ -377,7 +377,7 @@ def main():
     # Check prerequisites
     if not builder.check_prerequisites():
         print()
-        print("💡 To install missing dependencies, run:")
+        print("[TIP] To install missing dependencies, run:")
         print("   python build_executable.py --install-deps")
         sys.exit(1)
 
@@ -389,27 +389,27 @@ def main():
     if not skip_test:
         if not builder.test_executable():
             print()
-            print("⚠️  Executable test failed, but build completed.")
+            print("[WARNING]  Executable test failed, but build completed.")
             print("   You may still be able to use the executable.")
 
     # Create distribution package
     if not builder.create_distribution_package():
         print()
-        print("⚠️  Failed to create distribution package.")
+        print("[WARNING]  Failed to create distribution package.")
         print("   Executable is still available in dist/ directory.")
 
     # Show summary
     print()
     builder.show_build_summary()
 
-    print("🎉 Build process completed!")
+    print("[SUCCESS] Build process completed!")
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n👋 Build cancelled by user")
+        print("\n[CANCELLED] Build cancelled by user")
         sys.exit(0)
     except Exception as e:
-        print(f"\n❌ Build failed: {e}")
+        print(f"\n[ERROR] Build failed: {e}")
         sys.exit(1)
