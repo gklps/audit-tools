@@ -58,7 +58,7 @@ class RubixLauncher:
     def print_header(self):
         """Print application header"""
         print("=" * 60)
-        print("🚀 Rubix Token Sync Tool")
+        print("[RUBIX] Rubix Token Sync Tool")
         print("Cross-Platform Distributed Token Synchronization")
         print("=" * 60)
         print()
@@ -158,21 +158,21 @@ class RubixLauncher:
         self.clear_screen()
         self.print_header()
 
-        print("💻 System Information:")
-        print(f"   🖥️  Hostname: {platform.node()}")
-        print(f"   🏷️  System: {platform.system()} {platform.release()}")
-        print(f"   🏗️  Architecture: {platform.machine()}")
+        print("[SYSTEM] System Information:")
+        print(f"   [HOST]  Hostname: {platform.node()}")
+        print(f"   [INFO]  System: {platform.system()} {platform.release()}")
+        print(f"   [ARCH]  Architecture: {platform.machine()}")
         print(f"   🐍 Python Version: {sys.version.split()[0]}")
-        print(f"   📁 Working Directory: {current_dir}")
+        print(f"   [DIR] Working Directory: {current_dir}")
 
         # Check disk space
         try:
             import shutil
             total, used, free = shutil.disk_usage(current_dir)
             free_gb = free // (1024**3)
-            print(f"   💾 Available Disk Space: {free_gb} GB")
+            print(f"   [DISK] Available Disk Space: {free_gb} GB")
         except:
-            print(f"   💾 Available Disk Space: Unable to detect")
+            print(f"   [DISK] Available Disk Space: Unable to detect")
 
         # Check memory
         try:
@@ -194,11 +194,11 @@ class RubixLauncher:
         print()
 
         # Show configuration status
-        print("⚙️  Configuration Status:")
-        azure_status = "✅ Configured" if self.check_azure_sql_config() else "❌ Not configured"
-        telegram_status = "✅ Configured" if self.check_telegram_config() else "❌ Not configured"
-        print(f"   🗄️  Azure SQL Database: {azure_status}")
-        print(f"   📱 Telegram Notifications: {telegram_status}")
+        print("[CONFIG]  Configuration Status:")
+        azure_status = "[OK] Configured" if self.check_azure_sql_config() else "[ERROR] Not configured"
+        telegram_status = "[OK] Configured" if self.check_telegram_config() else "[ERROR] Not configured"
+        print(f"   [DB]  Azure SQL Database: {azure_status}")
+        print(f"   [TELEGRAM] Telegram Notifications: {telegram_status}")
         print()
 
         input("Press Enter to continue...")
@@ -208,13 +208,13 @@ class RubixLauncher:
         self.clear_screen()
         self.print_header()
 
-        print("🔧 Azure SQL Database Configuration")
+        print("[SETUP] Azure SQL Database Configuration")
         print("-" * 40)
         print()
 
         # Check if config already exists
         if self.check_azure_sql_config():
-            print("⚠️  Existing Azure SQL configuration found.")
+            print("[WARNING]  Existing Azure SQL configuration found.")
 
             # Show current configuration (masked)
             try:
@@ -297,11 +297,11 @@ class RubixLauncher:
                 f.write(connection_string)
 
             if self.test_azure_sql_connection():
-                self.print_status("✅ Database connection successful!", "SUCCESS")
+                self.print_status("[OK] Database connection successful!", "SUCCESS")
                 print()
                 input("Press Enter to continue...")
             else:
-                self.print_status("❌ Database connection failed!", "ERROR")
+                self.print_status("[ERROR] Database connection failed!", "ERROR")
                 print("Please check your credentials and try again.")
                 input("Press Enter to continue...")
 
@@ -314,12 +314,12 @@ class RubixLauncher:
         self.clear_screen()
         self.print_header()
 
-        print("📱 Telegram Configuration")
+        print("[TELEGRAM] Telegram Configuration")
         print("-" * 40)
         print()
 
         if self.check_telegram_config():
-            print("✅ Telegram is already configured.")
+            print("[OK] Telegram is already configured.")
 
             try:
                 with open(self.telegram_config_file, 'r') as f:
@@ -343,7 +343,7 @@ class RubixLauncher:
 
         # Setup new configuration
         print("Setting up Telegram notifications...")
-        print("📱 Bot Token and Chat ID are pre-configured.")
+        print("[TELEGRAM] Bot Token and Chat ID are pre-configured.")
         print()
 
         # Get machine name
@@ -359,16 +359,16 @@ class RubixLauncher:
             with open(self.telegram_config_file, 'w') as f:
                 json.dump(config, f, indent=2)
 
-            self.print_status("✅ Telegram configuration saved!", "SUCCESS")
+            self.print_status("[OK] Telegram configuration saved!", "SUCCESS")
 
             # Test connection
             print()
             self.print_status("Testing Telegram connection...", "INFO")
 
             if self.test_telegram_connection():
-                self.print_status("✅ Telegram connection successful!", "SUCCESS")
+                self.print_status("[OK] Telegram connection successful!", "SUCCESS")
             else:
-                self.print_status("⚠️  Telegram connection test failed", "WARNING")
+                self.print_status("[WARNING]  Telegram connection test failed", "WARNING")
                 print("Configuration saved but connection could not be verified.")
 
             print()
@@ -390,18 +390,18 @@ class RubixLauncher:
         # Test Azure SQL
         self.print_status("Testing Azure SQL Database connection...", "INFO")
         if self.test_azure_sql_connection():
-            self.print_status("✅ Azure SQL Database: Connected", "SUCCESS")
+            self.print_status("[OK] Azure SQL Database: Connected", "SUCCESS")
         else:
-            self.print_status("❌ Azure SQL Database: Failed", "ERROR")
+            self.print_status("[ERROR] Azure SQL Database: Failed", "ERROR")
 
         print()
 
         # Test Telegram
         self.print_status("Testing Telegram connection...", "INFO")
         if self.test_telegram_connection():
-            self.print_status("✅ Telegram: Connected", "SUCCESS")
+            self.print_status("[OK] Telegram: Connected", "SUCCESS")
         else:
-            self.print_status("❌ Telegram: Failed", "ERROR")
+            self.print_status("[ERROR] Telegram: Failed", "ERROR")
 
         print()
         input("Press Enter to continue...")
@@ -413,22 +413,22 @@ class RubixLauncher:
 
         print("Current Configuration:")
         if azure_configured:
-            print("✅ MSSQL: Configured")
+            print("[OK] MSSQL: Configured")
             if self.test_azure_sql_connection():
                 print("   🔗 Connection: Working")
             else:
-                print("   ⚠️  Connection: Failed")
+                print("   [WARNING]  Connection: Failed")
         else:
-            print("❌ MSSQL: Not configured")
+            print("[ERROR] MSSQL: Not configured")
 
         if telegram_configured:
-            print("✅ Telegram: Configured")
+            print("[OK] Telegram: Configured")
             if self.test_telegram_connection():
                 print("   🔗 Connection: Working")
             else:
-                print("   ⚠️  Connection: Failed")
+                print("   [WARNING]  Connection: Failed")
         else:
-            print("❌ Telegram: Not configured")
+            print("[ERROR] Telegram: Not configured")
 
         print()
         return azure_configured and telegram_configured
@@ -438,13 +438,13 @@ class RubixLauncher:
         self.clear_screen()
         self.print_header()
 
-        print(f"🚀 Running {sync_type.title()} Sync")
+        print(f"[RUBIX] Running {sync_type.title()} Sync")
         print("-" * 40)
         print()
 
         # Check prerequisites
         if not self.check_azure_sql_config():
-            self.print_status("❌ Azure SQL Database not configured!", "ERROR")
+            self.print_status("[ERROR] Azure SQL Database not configured!", "ERROR")
             print("Please configure database credentials first.")
             input("Press Enter to continue...")
             return
@@ -455,7 +455,7 @@ class RubixLauncher:
             try:
                 with open(self.telegram_config_file, 'w') as f:
                     json.dump(self.default_telegram_config, f, indent=2)
-                self.print_status("✅ Telegram configured with default settings", "SUCCESS")
+                self.print_status("[OK] Telegram configured with default settings", "SUCCESS")
             except Exception as e:
                 self.print_status(f"Warning: Could not setup Telegram: {e}", "WARNING")
 
@@ -477,12 +477,12 @@ class RubixLauncher:
             result = subprocess.run(sync_cmd, cwd=current_dir)
 
             if result.returncode == 0:
-                self.print_status("✅ Sync completed successfully!", "SUCCESS")
+                self.print_status("[OK] Sync completed successfully!", "SUCCESS")
             else:
-                self.print_status(f"❌ Sync failed with exit code {result.returncode}", "ERROR")
+                self.print_status(f"[ERROR] Sync failed with exit code {result.returncode}", "ERROR")
 
         except Exception as e:
-            self.print_status(f"❌ Error running sync: {e}", "ERROR")
+            self.print_status(f"[ERROR] Error running sync: {e}", "ERROR")
 
         print()
         input("Press Enter to continue...")
@@ -509,7 +509,7 @@ class RubixLauncher:
             print()
 
             if not all_configured:
-                self.print_status("⚠️  Some configurations are missing. Please setup credentials first.", "WARNING")
+                self.print_status("[WARNING]  Some configurations are missing. Please setup credentials first.", "WARNING")
                 print()
 
             try:
@@ -519,7 +519,7 @@ class RubixLauncher:
                     self.run_sync("standard")
                 elif choice == "2":
                     print()
-                    confirm = input("⚠️  This will delete ALL existing records. Type 'YES' to confirm: ").strip()
+                    confirm = input("[WARNING]  This will delete ALL existing records. Type 'YES' to confirm: ").strip()
                     if confirm == "YES":
                         self.run_sync("full")
                     else:

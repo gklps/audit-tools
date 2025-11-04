@@ -39,7 +39,7 @@ def should_show_help() -> bool:
 
 def show_usage():
     """Show comprehensive usage information"""
-    print("🚀 Rubix Token Sync Tool")
+    print("[RUBIX] Rubix Token Sync Tool")
     print("Cross-Platform Distributed Token Synchronization")
     print("=" * 60)
     print()
@@ -73,13 +73,13 @@ def show_usage():
     print("  rubix_sync_main.py --test-only           # Test connections only")
     print()
     print("FEATURES:")
-    print("  🗂️  Per-node IPFS detection (automatic binary discovery)")
-    print("  📊 SQLite schema compatibility (handles missing columns)")
-    print("  🔄 Universal IPFS binary detection")
-    print("  🗄️  Azure SQL Database integration")
-    print("  📱 Real-time Telegram notifications")
-    print("  📊 Comprehensive audit logging")
-    print("  🖥️  Cross-platform compatibility (Windows/macOS/Linux)")
+    print("  [IPFS]  Per-node IPFS detection (automatic binary discovery)")
+    print("  [DATA] SQLite schema compatibility (handles missing columns)")
+    print("  [SYNC] Universal IPFS binary detection")
+    print("  [DB]  Azure SQL Database integration")
+    print("  [TELEGRAM] Real-time Telegram notifications")
+    print("  [DATA] Comprehensive audit logging")
+    print("  [PLATFORM]  Cross-platform compatibility (Windows/macOS/Linux)")
     print()
     print("CONFIGURATION:")
     print("  Configuration files are automatically created in the current directory:")
@@ -95,11 +95,11 @@ def run_interactive_launcher():
         launcher = RubixLauncher()
         launcher.show_main_menu()
     except ImportError as e:
-        print(f"❌ Error: Could not import launcher module: {e}")
+        print(f"[ERROR] Error: Could not import launcher module: {e}")
         print("Please ensure all required files are present.")
         sys.exit(1)
     except Exception as e:
-        print(f"❌ Error running interactive launcher: {e}")
+        print(f"[ERROR] Error running interactive launcher: {e}")
         sys.exit(1)
 
 def run_direct_sync():
@@ -118,11 +118,11 @@ def run_direct_sync():
         sync_main()
 
     except ImportError as e:
-        print(f"❌ Error: Could not import sync module: {e}")
+        print(f"[ERROR] Error: Could not import sync module: {e}")
         print("Please ensure sync_distributed_tokens.py is present.")
         sys.exit(1)
     except Exception as e:
-        print(f"❌ Error running sync: {e}")
+        print(f"[ERROR] Error running sync: {e}")
         sys.exit(1)
 
 def check_basic_requirements():
@@ -146,7 +146,7 @@ def check_basic_requirements():
             errors.append(f"Required file missing: {file}")
 
     if errors:
-        print("❌ Requirements Check Failed:")
+        print("[ERROR] Requirements Check Failed:")
         for error in errors:
             print(f"   • {error}")
         print()
@@ -169,21 +169,21 @@ def main():
 
     # Determine mode and run appropriate function
     if is_interactive_mode():
-        print("🚀 Starting Rubix Token Sync - Interactive Mode")
+        print("[START] Starting Rubix Token Sync - Interactive Mode")
         print("Use --help for command-line options")
         print()
         run_interactive_launcher()
     else:
-        print("🚀 Starting Rubix Token Sync - Direct Mode")
+        print("[START] Starting Rubix Token Sync - Direct Mode")
         run_direct_sync()
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n👋 Goodbye!")
+        print("\n[EXIT] Goodbye!")
         sys.exit(0)
     except Exception as e:
-        print(f"\n❌ Unexpected error: {e}")
+        print(f"\n[ERROR] Unexpected error: {e}")
         print("Please check the logs or run with --help for usage information.")
         sys.exit(1)
