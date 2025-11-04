@@ -36,7 +36,7 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.9'
 
@@ -56,6 +56,12 @@ jobs:
       run: |
         brew install unixodbc
 
+    - name: Install system dependencies (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        # Windows has ODBC drivers built-in, no additional setup needed
+        echo "Windows ODBC drivers already available"
+
     - name: Install Python dependencies
       run: |
         pip install pyodbc requests
@@ -63,6 +69,7 @@ jobs:
     - name: Remove conflicting packages
       run: |
         pip uninstall -y pathlib || true
+      shell: bash
 
     - name: Build executable
       run: |
@@ -131,7 +138,7 @@ jobs:
       shell: bash
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: RubixTokenSync-${{ matrix.platform }}
         path: RubixTokenSync-${{ matrix.platform }}-${{ github.ref_name }}.*
@@ -147,7 +154,9 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Download all artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
+      with:
+        merge-multiple: true
 
     - name: Create release notes
       run: |
@@ -203,12 +212,12 @@ jobs:
         EOF
 
     - name: Create Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         name: Release ${{ github.ref_name }}
         body_path: RELEASE_NOTES.md
         files: |
-          */RubixTokenSync-*
+          RubixTokenSync-*
         draft: false
         prerelease: false
       env:
