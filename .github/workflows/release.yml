@@ -25,10 +25,11 @@ jobs:
             platform: linux
             executable: RubixTokenSync
             archive: tar.gz
-          - os: windows-latest
-            platform: windows
-            executable: RubixTokenSync.exe
-            archive: zip
+          # Temporarily disabled Windows builds - focus on core platforms
+          # - os: windows-latest
+          #   platform: windows
+          #   executable: RubixTokenSync.exe
+          #   archive: zip
           - os: macos-latest
             platform: macos
             executable: RubixTokenSync
@@ -220,7 +221,6 @@ jobs:
 
         | Platform | File | Notes |
         |----------|------|-------|
-        | **Windows** | RubixTokenSync-windows-${{ github.ref_name }}.zip | Windows 10+ (64-bit) |
         | **macOS** | RubixTokenSync-macos-${{ github.ref_name }}.tar.gz | macOS 10.14+ (Universal) |
         | **Linux** | RubixTokenSync-linux-${{ github.ref_name }}.tar.gz | Ubuntu 18.04+, CentOS 7+ |
 
@@ -229,7 +229,6 @@ jobs:
         1. Download the appropriate file for your OS
         2. Extract the archive
         3. Run the executable:
-           - Windows: Double-click `RubixTokenSync.exe`
            - macOS/Linux: `./RubixTokenSync`
         4. Follow the interactive setup prompts
 
