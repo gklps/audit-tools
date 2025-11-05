@@ -45,7 +45,14 @@ def find_ipfs_binary() -> str:
     """Universal IPFS binary detection for any VM setup"""
 
     search_paths = []
-    current_dir = Path.cwd()
+
+    # Dynamic directory detection based on executable location
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        # Bundled executable - search from executable's directory
+        current_dir = Path(sys.executable).parent
+    else:
+        # Python script - use current working directory
+        current_dir = Path.cwd()
 
     # 1. Search current directory tree (up to 5 levels up)
     for i in range(6):
@@ -91,8 +98,8 @@ def find_ipfs_binary() -> str:
             if ipfs_path.exists() and ipfs_path.is_file():
                 search_paths.append(str(ipfs_path))
 
-    # 5. Add fallback system command
-    search_paths.extend(['./ipfs', '../ipfs', 'ipfs'])
+    # 5. Add fallback system command (relative to current directory)
+    search_paths.extend([str(current_dir / 'ipfs'), 'ipfs'])
 
     # Test each path
     for ipfs_path in search_paths:
@@ -1535,7 +1542,14 @@ def run_essential_metadata_capture() -> bool:
         print("📊 Database tables ready")
 
         # Find all databases
-        search_path = os.path.join('..', 'Node') if os.path.exists('../Node') else '..'
+        # Dynamic search path based on executable location
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            # Bundled executable - search from executable's parent directory
+            search_path = str(Path(sys.executable).parent)
+        else:
+            # Python script - use original logic for development
+            search_path = os.path.join('..', 'Node') if os.path.exists('../Node') else '..'
+
         databases = find_rubix_databases(search_path)
 
         if not databases:
@@ -2915,8 +2929,16 @@ def main():
 
             # Find all rubix.db files
             with OperationContext("FIND_DATABASES", 'MAIN', logger):
-                # Search from parent directory when running from cloned repo
-                search_path = os.path.join('..', 'Node') if os.path.exists('../Node') else '..'
+                # Dynamic search path based on executable location
+                if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+                    # Bundled executable - search from executable's parent directory
+                    search_path = str(Path(sys.executable).parent)
+                    logger.info(f"Bundled executable detected, searching from: {search_path}")
+                else:
+                    # Python script - use original logic for development
+                    search_path = os.path.join('..', 'Node') if os.path.exists('../Node') else '..'
+                    logger.info(f"Python script mode, searching from: {search_path}")
+
                 databases = find_rubix_databases(search_path)
                 sync_metrics.total_databases_found = len(databases)
 
