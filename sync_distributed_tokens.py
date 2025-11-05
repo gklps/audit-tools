@@ -2230,12 +2230,35 @@ def bulk_insert_records(records: List[TokenRecord]) -> Tuple[int, int]:
             # Set shorter timeout for large operations to prevent network hangs
             conn.timeout = 300  # 5 minutes timeout
 
+            # Use MERGE to prevent duplicate records based on composite key (token_id + source_ip + node_name)
             insert_query = """
-                INSERT INTO [dbo].[TokenRecords]
+                MERGE [dbo].[TokenRecords] AS target
+                USING (VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)) AS source
                 ([source_ip], [node_name], [did], [token_id], [created_at], [updated_at],
                  [token_status], [parent_token_id], [token_value], [ipfs_data], [ipfs_fetched],
                  [ipfs_error], [db_path], [ipfs_path], [db_last_modified], [validation_errors])
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON target.[token_id] = source.[token_id]
+                   AND target.[source_ip] = source.[source_ip]
+                   AND target.[node_name] = source.[node_name]
+                WHEN NOT MATCHED THEN
+                    INSERT ([source_ip], [node_name], [did], [token_id], [created_at], [updated_at],
+                           [token_status], [parent_token_id], [token_value], [ipfs_data], [ipfs_fetched],
+                           [ipfs_error], [db_path], [ipfs_path], [db_last_modified], [validation_errors])
+                    VALUES ([source_ip], [node_name], [did], [token_id], [created_at], [updated_at],
+                           [token_status], [parent_token_id], [token_value], [ipfs_data], [ipfs_fetched],
+                           [ipfs_error], [db_path], [ipfs_path], [db_last_modified], [validation_errors])
+                WHEN MATCHED AND source.[updated_at] > target.[updated_at] THEN
+                    UPDATE SET
+                        [did] = source.[did],
+                        [updated_at] = source.[updated_at],
+                        [token_status] = source.[token_status],
+                        [parent_token_id] = source.[parent_token_id],
+                        [token_value] = source.[token_value],
+                        [ipfs_data] = source.[ipfs_data],
+                        [ipfs_fetched] = source.[ipfs_fetched],
+                        [ipfs_error] = source.[ipfs_error],
+                        [db_last_modified] = source.[db_last_modified],
+                        [validation_errors] = source.[validation_errors];
             """
 
             # Process in smaller chunks to prevent Azure SQL timeout
@@ -2951,6 +2974,39 @@ def main():
     global connection_pool
 
     with OperationContext("DISTRIBUTED_TOKEN_SYNC", 'MAIN', logger):
+        # Process lock to prevent concurrent executions
+        lock_file = "sync_distributed_tokens.lock"
+        if os.path.exists(lock_file):
+            try:
+                with open(lock_file, 'r') as f:
+                    existing_pid = f.read().strip()
+
+                # Check if the process is still running
+                if existing_pid.isdigit():
+                    try:
+                        import psutil
+                        if psutil.pid_exists(int(existing_pid)):
+                            logger.error(f"Another sync process is already running (PID: {existing_pid})")
+                            logger.error("Wait for the current sync to complete, or remove the lock file: sync_distributed_tokens.lock")
+                            sys.exit(1)
+                    except ImportError:
+                        # Fallback for systems without psutil
+                        logger.warning(f"Lock file exists (PID: {existing_pid}). If no sync is running, delete: {lock_file}")
+                        time.sleep(2)  # Brief delay before proceeding
+
+                # Stale lock file, remove it
+                os.remove(lock_file)
+            except Exception as e:
+                logger.warning(f"Could not read lock file: {e}")
+
+        # Create lock file with current PID
+        try:
+            with open(lock_file, 'w') as f:
+                f.write(str(os.getpid()))
+            logger.info(f"Created process lock file: {lock_file}")
+        except Exception as e:
+            logger.warning(f"Could not create lock file: {e}")
+
         try:
             # Get script directory (where ipfs executable should be)
             script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -3090,6 +3146,22 @@ def main():
                 }
             )
 
+            # CRITICAL FIX: Add session tracking to prevent infinite loops
+            session_tracking_file = "sync_session_completed.flag"
+            if os.path.exists(session_tracking_file):
+                logger.warning("Previous sync session was already completed. Skipping to prevent infinite loop.")
+                logger.warning("If you want to force a new sync, delete the file: sync_session_completed.flag")
+                return
+
+            # Create session tracking file
+            try:
+                with open(session_tracking_file, 'w') as f:
+                    f.write(f"Session started: {datetime.now().isoformat()}\n")
+                    f.write(f"Databases to process: {len(databases_to_process)}\n")
+                logger.info(f"Created session tracking file: {session_tracking_file}")
+            except Exception as e:
+                logger.warning(f"Could not create session tracking file: {e}")
+
             # Process each database with enhanced monitoring
             for idx, (db_path, db_last_modified) in enumerate(databases_to_process, 1):
                 db_correlation_id = audit_logger.start_operation(f"PROCESS_DB_{idx}")
@@ -3187,6 +3259,15 @@ def main():
             with OperationContext("GENERATE_FINAL_REPORT", 'MAIN', logger):
                 generate_final_report()
 
+                # Clean up session tracking file on successful completion
+                session_tracking_file = "sync_session_completed.flag"
+                try:
+                    if os.path.exists(session_tracking_file):
+                        os.remove(session_tracking_file)
+                        logger.info(f"Removed session tracking file: {session_tracking_file}")
+                except Exception as e:
+                    logger.warning(f"Could not remove session tracking file: {e}")
+
                 # Send Telegram completion notification
                 if telegram_enabled:
                     try:
@@ -3194,6 +3275,10 @@ def main():
                         notify_completion(final_metrics)
                     except Exception as e:
                         logger.warning(f"Failed to send completion notification: {e}")
+
+                # FINAL EXIT - Process completed successfully
+                logger.info("🎯 ALL DATABASES PROCESSED SUCCESSFULLY - SYNC COMPLETED")
+                logger.info("🚪 FINAL EXIT - No infinite loop, process terminating normally")
 
         except KeyboardInterrupt:
             audit_logger.log_with_context(
@@ -3242,6 +3327,18 @@ def main():
         finally:
             # Clean up resources
             try:
+                # Remove process lock file
+                lock_file = "sync_distributed_tokens.lock"
+                if os.path.exists(lock_file):
+                    os.remove(lock_file)
+                    logger.info(f"Removed process lock file: {lock_file}")
+
+                # Remove session tracking file
+                session_tracking_file = "sync_session_completed.flag"
+                if os.path.exists(session_tracking_file):
+                    os.remove(session_tracking_file)
+                    logger.info(f"Removed session tracking file: {session_tracking_file}")
+
                 # Clean up connection pool
                 if connection_pool:
                     connection_pool.close_all()
@@ -3256,6 +3353,9 @@ def main():
 
                 # End main operation
                 audit_logger.end_operation()
+
+                # Final exit confirmation
+                logger.info("🎯 SYNC PROCESS COMPLETED - FINAL EXIT")
 
             except Exception as cleanup_error:
                 print(f"Error during cleanup: {cleanup_error}")
