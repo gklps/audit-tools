@@ -1775,34 +1775,101 @@ def create_azure_sql_tables():
 
 
 def get_processed_databases() -> Dict[str, float]:
-    """Get dictionary of already processed databases and their last_modified timestamps."""
+    """
+    Get dictionary of already processed databases and their last_modified timestamps.
+    Enhanced with robust error handling and detailed logging for infinite loop debugging.
+    """
+    logger.info("🔍 INFINITE LOOP DEBUG: Starting get_processed_databases()")
+
     pool = init_connection_pool()
     conn = pool.get_connection()
+    processed = {}
 
     try:
         cursor = conn.cursor()
+
+        # First, verify table exists
+        logger.info("🔍 INFINITE LOOP DEBUG: Checking if ProcessedDatabases table exists")
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_NAME = 'ProcessedDatabases' AND TABLE_SCHEMA = 'dbo'
+        """)
+        table_exists = cursor.fetchone()[0] > 0
+        logger.info(f"🔍 INFINITE LOOP DEBUG: ProcessedDatabases table exists: {table_exists}")
+
+        if not table_exists:
+            logger.warning("🔍 INFINITE LOOP DEBUG: ProcessedDatabases table does not exist - returning empty dict")
+            cursor.close()
+            return {}
+
+        # Execute main query with detailed logging
+        logger.info("🔍 INFINITE LOOP DEBUG: Executing SELECT query on ProcessedDatabases")
         cursor.execute("""
             SELECT [db_path], DATEDIFF(SECOND, '1970-01-01', [last_modified])
             FROM [dbo].[ProcessedDatabases]
         """)
 
-        processed = {row[0]: float(row[1]) for row in cursor.fetchall()}
+        rows = cursor.fetchall()
+        row_count = len(rows)
+        logger.info(f"🔍 INFINITE LOOP DEBUG: Found {row_count} rows in ProcessedDatabases table")
+
+        # Process results with validation
+        for i, row in enumerate(rows):
+            db_path, timestamp = row[0], float(row[1])
+            processed[db_path] = timestamp
+            logger.info(f"🔍 INFINITE LOOP DEBUG: Row {i+1}: {db_path} -> {timestamp}")
+
+        logger.info(f"🔍 INFINITE LOOP DEBUG: Successfully processed {len(processed)} database entries")
+        logger.info(f"🔍 INFINITE LOOP DEBUG: Processed databases: {list(processed.keys())}")
+
         cursor.close()
+
+        # Final validation
+        if not processed:
+            logger.warning("🔍 INFINITE LOOP DEBUG: WARNING - No processed databases found! This will cause all databases to be processed!")
+        else:
+            logger.info(f"🔍 INFINITE LOOP DEBUG: SUCCESS - Found {len(processed)} processed databases")
+
         return processed
 
     except Exception as e:
-        logger.error(f"Error getting processed databases: {e}")
+        logger.error(f"🔍 INFINITE LOOP DEBUG: CRITICAL ERROR in get_processed_databases(): {e}")
+        logger.error(f"🔍 INFINITE LOOP DEBUG: Exception type: {type(e).__name__}")
+        logger.error(f"🔍 INFINITE LOOP DEBUG: Exception details: {str(e)}")
         sync_metrics.add_error("database", f"Failed to get processed databases: {e}")
+
+        # CRITICAL: Log that this will cause infinite loop
+        logger.error("🔍 INFINITE LOOP DEBUG: *** RETURNING EMPTY DICT - THIS WILL CAUSE INFINITE LOOP ***")
+
         return {}
     finally:
         pool.return_connection(conn)
 
 
 def needs_processing(db_path: str, db_last_modified: float, processed_dbs: Dict[str, float]) -> bool:
-    """Check if a database needs to be processed based on last_modified timestamp."""
+    """
+    Check if a database needs to be processed based on last_modified timestamp.
+    Enhanced with detailed logging for infinite loop debugging.
+    """
+    logger.info(f"🔍 INFINITE LOOP DEBUG: Checking if {db_path} needs processing")
+    logger.info(f"🔍 INFINITE LOOP DEBUG: Current file timestamp: {db_last_modified}")
+    logger.info(f"🔍 INFINITE LOOP DEBUG: Total processed databases available: {len(processed_dbs)}")
+
     if db_path not in processed_dbs:
+        logger.info(f"🔍 INFINITE LOOP DEBUG: *** {db_path} NOT FOUND in processed_dbs - NEEDS PROCESSING ***")
+        logger.info(f"🔍 INFINITE LOOP DEBUG: Available paths in processed_dbs: {list(processed_dbs.keys())}")
         return True
-    return db_last_modified > processed_dbs[db_path]
+
+    stored_timestamp = processed_dbs[db_path]
+    logger.info(f"🔍 INFINITE LOOP DEBUG: Found {db_path} in processed_dbs with timestamp: {stored_timestamp}")
+
+    if db_last_modified > stored_timestamp:
+        logger.info(f"🔍 INFINITE LOOP DEBUG: *** {db_path} IS NEWER than stored ({db_last_modified} > {stored_timestamp}) - NEEDS PROCESSING ***")
+        return True
+    else:
+        logger.info(f"🔍 INFINITE LOOP DEBUG: *** {db_path} IS UP TO DATE ({db_last_modified} <= {stored_timestamp}) - SKIP PROCESSING ***")
+        return False
 
 
 def process_database_incremental(db_path: str, db_last_modified: float, source_ip: str, script_dir: str, ipfs_mapping: Dict[str, str]) -> bool:
@@ -2659,7 +2726,13 @@ def bulk_insert_essential_records(records: List[TokenRecord]) -> Tuple[int, int]
 def update_processed_database(db_path: str, db_last_modified: float, record_count: int,
                                ipfs_success: int, ipfs_fail: int, validation_errors: int = 0,
                                processing_duration: float = 0):
-    """Update the ProcessedDatabases table with processing metadata."""
+    """
+    Update the ProcessedDatabases table with processing metadata.
+    Enhanced with verification to prevent infinite loop issues.
+    """
+    logger.info(f"🔍 INFINITE LOOP DEBUG: Updating processed database record for {db_path}")
+    logger.info(f"🔍 INFINITE LOOP DEBUG: Timestamp: {db_last_modified}, Records: {record_count}")
+
     pool = init_connection_pool()
     conn = pool.get_connection()
 
@@ -2668,6 +2741,7 @@ def update_processed_database(db_path: str, db_last_modified: float, record_coun
         db_modified_dt = datetime.fromtimestamp(db_last_modified)
 
         # Use MERGE for upsert operation in Azure SQL Database
+        logger.info(f"🔍 INFINITE LOOP DEBUG: Executing MERGE statement for {db_path}")
         cursor.execute("""
             MERGE [dbo].[ProcessedDatabases] AS target
             USING (VALUES (?, ?, GETUTCDATE(), ?, ?, ?, ?, ?)) AS source
@@ -2690,16 +2764,48 @@ def update_processed_database(db_path: str, db_last_modified: float, record_coun
                        source.[ipfs_success_count], source.[ipfs_fail_count], source.[validation_error_count], source.[processing_duration_seconds]);
         """, (db_path, db_modified_dt, record_count, ipfs_success, ipfs_fail, validation_errors, processing_duration))
 
+        # Check how many rows were affected
+        rows_affected = cursor.rowcount
+        logger.info(f"🔍 INFINITE LOOP DEBUG: MERGE statement affected {rows_affected} rows")
+
         conn.commit()
+        logger.info(f"🔍 INFINITE LOOP DEBUG: Transaction committed successfully for {db_path}")
+
+        # CRITICAL: Verify the record was actually saved by reading it back
+        logger.info(f"🔍 INFINITE LOOP DEBUG: Verifying record was saved - reading back from database")
+        cursor.execute("""
+            SELECT [db_path], DATEDIFF(SECOND, '1970-01-01', [last_modified]), [record_count]
+            FROM [dbo].[ProcessedDatabases]
+            WHERE [db_path] = ?
+        """, (db_path,))
+
+        verification_row = cursor.fetchone()
+        if verification_row:
+            saved_path, saved_timestamp, saved_count = verification_row
+            logger.info(f"🔍 INFINITE LOOP DEBUG: *** VERIFICATION SUCCESS *** Record found for {saved_path}")
+            logger.info(f"🔍 INFINITE LOOP DEBUG: Saved timestamp: {saved_timestamp}, Record count: {saved_count}")
+
+            # Additional validation - ensure timestamps match
+            if abs(float(saved_timestamp) - db_last_modified) < 1.0:  # Allow 1 second tolerance
+                logger.info(f"🔍 INFINITE LOOP DEBUG: *** TIMESTAMP VERIFICATION SUCCESS *** Timestamps match")
+            else:
+                logger.error(f"🔍 INFINITE LOOP DEBUG: *** TIMESTAMP MISMATCH *** Expected: {db_last_modified}, Saved: {saved_timestamp}")
+        else:
+            logger.error(f"🔍 INFINITE LOOP DEBUG: *** VERIFICATION FAILED *** Record NOT found after commit!")
+            logger.error(f"🔍 INFINITE LOOP DEBUG: This will cause infinite loop - database will be processed again!")
+
         cursor.close()
 
     except Exception as e:
-        logger.error(f"Error updating processed database metadata: {e}")
+        logger.error(f"🔍 INFINITE LOOP DEBUG: *** CRITICAL ERROR *** Failed to update processed database: {e}")
+        logger.error(f"🔍 INFINITE LOOP DEBUG: Exception type: {type(e).__name__}")
+        logger.error(f"🔍 INFINITE LOOP DEBUG: This will cause infinite loop - database will be processed again!")
         sync_metrics.add_error("database", f"Failed to update metadata: {e}", {"db_path": db_path})
         try:
             conn.rollback()
-        except:
-            pass
+            logger.info(f"🔍 INFINITE LOOP DEBUG: Transaction rolled back")
+        except Exception as rollback_error:
+            logger.error(f"🔍 INFINITE LOOP DEBUG: Rollback also failed: {rollback_error}")
     finally:
         pool.return_connection(conn)
 
@@ -2944,6 +3050,30 @@ def clear_all_records():
 
 def main():
     """Main function to orchestrate the distributed token sync with Azure SQL Database."""
+
+    # CRITICAL: Track main() execution for infinite loop debugging
+    execution_timestamp = datetime.now()
+    logger.info("🔍 INFINITE LOOP DEBUG: *** MAIN() FUNCTION STARTED ***")
+    logger.info(f"🔍 INFINITE LOOP DEBUG: Execution timestamp: {execution_timestamp.isoformat()}")
+    logger.info(f"🔍 INFINITE LOOP DEBUG: Process PID: {os.getpid()}")
+    logger.info(f"🔍 INFINITE LOOP DEBUG: Current working directory: {os.getcwd()}")
+
+    # Check for rapid re-execution (potential infinite loop detection)
+    execution_log_file = "main_execution.log"
+    try:
+        if os.path.exists(execution_log_file):
+            with open(execution_log_file, 'r') as f:
+                last_lines = f.readlines()[-5:]  # Get last 5 executions
+            logger.info(f"🔍 INFINITE LOOP DEBUG: Previous executions: {len(last_lines)}")
+            for line in last_lines:
+                logger.info(f"🔍 INFINITE LOOP DEBUG: Previous: {line.strip()}")
+
+        # Log this execution
+        with open(execution_log_file, 'a') as f:
+            f.write(f"{execution_timestamp.isoformat()} - PID:{os.getpid()}\n")
+    except Exception as e:
+        logger.warning(f"🔍 INFINITE LOOP DEBUG: Could not track execution history: {e}")
+
     # Start main operation with correlation tracking
     main_correlation_id = audit_logger.start_operation("MAIN_SYNC_OPERATION")
 
@@ -3117,19 +3247,71 @@ def main():
                     extra_data={'processed_count': len(processed_dbs)}
                 )
 
-            # Filter databases that need processing
-            databases_to_process = [
-                (db_path, last_mod)
-                for db_path, last_mod in databases
-                if needs_processing(db_path, last_mod, processed_dbs)
-            ]
+            # ENHANCED PROCESSING DECISION: Multiple verification layers to prevent infinite loops
+            logger.info(f"🔍 INFINITE LOOP DEBUG: Starting processing decision analysis")
+            logger.info(f"🔍 INFINITE LOOP DEBUG: Total databases found: {len(databases)}")
+            logger.info(f"🔍 INFINITE LOOP DEBUG: Processed databases retrieved: {len(processed_dbs)}")
 
+            # Filter databases that need processing with detailed logging for each decision
+            databases_to_process = []
+            for db_path, last_mod in databases:
+                needs_proc = needs_processing(db_path, last_mod, processed_dbs)
+                if needs_proc:
+                    databases_to_process.append((db_path, last_mod))
+                    logger.info(f"🔍 INFINITE LOOP DEBUG: *** WILL PROCESS *** {db_path}")
+                else:
+                    logger.info(f"🔍 INFINITE LOOP DEBUG: *** WILL SKIP *** {db_path}")
+
+            logger.info(f"🔍 INFINITE LOOP DEBUG: Final decision: {len(databases_to_process)} databases need processing")
+
+            # DEFINITIVE EXIT LOGIC: Multiple verification layers
             if not databases_to_process:
+                logger.info("🔍 INFINITE LOOP DEBUG: *** NO DATABASES TO PROCESS - IMPLEMENTING DEFINITIVE EXIT ***")
+
+                # Verification Layer 1: Double-check processed databases count
+                if len(processed_dbs) >= len(databases):
+                    logger.info(f"🔍 INFINITE LOOP DEBUG: ✅ VERIFICATION 1 PASSED: processed_dbs ({len(processed_dbs)}) >= total_dbs ({len(databases)})")
+                else:
+                    logger.warning(f"🔍 INFINITE LOOP DEBUG: ⚠️ VERIFICATION 1 FAILED: processed_dbs ({len(processed_dbs)}) < total_dbs ({len(databases)})")
+                    logger.warning(f"🔍 INFINITE LOOP DEBUG: This indicates a potential infinite loop condition!")
+
+                # Verification Layer 2: Cross-check database paths
+                processed_paths = set(processed_dbs.keys())
+                found_paths = set(db_path for db_path, _ in databases)
+                missing_from_processed = found_paths - processed_paths
+                if not missing_from_processed:
+                    logger.info(f"🔍 INFINITE LOOP DEBUG: ✅ VERIFICATION 2 PASSED: All database paths are in processed_dbs")
+                else:
+                    logger.warning(f"🔍 INFINITE LOOP DEBUG: ⚠️ VERIFICATION 2 FAILED: Missing paths: {missing_from_processed}")
+
+                # Verification Layer 3: Timestamp consistency check
+                timestamp_issues = []
+                for db_path, last_mod in databases:
+                    if db_path in processed_dbs:
+                        stored_timestamp = processed_dbs[db_path]
+                        if last_mod > stored_timestamp:
+                            timestamp_issues.append(f"{db_path}: file={last_mod}, stored={stored_timestamp}")
+
+                if not timestamp_issues:
+                    logger.info(f"🔍 INFINITE LOOP DEBUG: ✅ VERIFICATION 3 PASSED: All timestamps are consistent")
+                else:
+                    logger.warning(f"🔍 INFINITE LOOP DEBUG: ⚠️ VERIFICATION 3 FAILED: Timestamp issues: {timestamp_issues}")
+
+                # Final exit decision with comprehensive logging
                 audit_logger.log_with_context(
-                    logger, logging.INFO, "All databases are up to date. Nothing to process.",
+                    logger, logging.INFO, "🎯 DEFINITIVE EXIT: All databases are up to date. Nothing to process.",
                     component='MAIN', operation='PROCESSING_CHECK',
-                    extra_data={'up_to_date_count': len(databases)}
+                    extra_data={
+                        'up_to_date_count': len(databases),
+                        'processed_count': len(processed_dbs),
+                        'verification_1_passed': len(processed_dbs) >= len(databases),
+                        'verification_2_passed': len(missing_from_processed) == 0,
+                        'verification_3_passed': len(timestamp_issues) == 0
+                    }
                 )
+
+                logger.info("🔍 INFINITE LOOP DEBUG: *** DEFINITIVE EXIT - SYNC PROCESS TERMINATING ***")
+                print("✅ All databases are up to date. No processing needed.")
                 return
 
             # Show processing plan on console
@@ -3146,21 +3328,46 @@ def main():
                 }
             )
 
-            # CRITICAL FIX: Add session tracking to prevent infinite loops
+            # ENHANCED SESSION TRACKING: Prevent infinite loops with multiple verification layers
             session_tracking_file = "sync_session_completed.flag"
-            if os.path.exists(session_tracking_file):
-                logger.warning("Previous sync session was already completed. Skipping to prevent infinite loop.")
-                logger.warning("If you want to force a new sync, delete the file: sync_session_completed.flag")
-                return
+            logger.info(f"🔍 INFINITE LOOP DEBUG: Checking for existing session tracking file: {session_tracking_file}")
 
-            # Create session tracking file
+            if os.path.exists(session_tracking_file):
+                logger.info(f"🔍 INFINITE LOOP DEBUG: Session tracking file exists - reading contents")
+                try:
+                    with open(session_tracking_file, 'r') as f:
+                        session_content = f.read()
+                    logger.info(f"🔍 INFINITE LOOP DEBUG: Session file contents:\n{session_content}")
+
+                    # Check if this is a recent session (within last hour)
+                    file_age = time.time() - os.path.getmtime(session_tracking_file)
+                    logger.info(f"🔍 INFINITE LOOP DEBUG: Session file age: {file_age:.1f} seconds ({file_age/3600:.1f} hours)")
+
+                    if file_age < 3600:  # Less than 1 hour old
+                        logger.warning("🔍 INFINITE LOOP DEBUG: *** PREVENTING INFINITE LOOP ***")
+                        logger.warning("Previous sync session completed recently (< 1 hour ago)")
+                        logger.warning("This prevents infinite loop execution")
+                        logger.warning(f"To force a new sync, delete: {session_tracking_file}")
+                        logger.warning("Or wait 1 hour for automatic session reset")
+                        return
+                    else:
+                        logger.info(f"🔍 INFINITE LOOP DEBUG: Session file is old ({file_age/3600:.1f} hours) - allowing new session")
+                        os.remove(session_tracking_file)
+                        logger.info(f"🔍 INFINITE LOOP DEBUG: Removed old session file")
+                except Exception as e:
+                    logger.warning(f"🔍 INFINITE LOOP DEBUG: Could not read session file: {e}")
+
+            # Create NEW session tracking file
             try:
+                logger.info(f"🔍 INFINITE LOOP DEBUG: Creating new session tracking file")
                 with open(session_tracking_file, 'w') as f:
                     f.write(f"Session started: {datetime.now().isoformat()}\n")
                     f.write(f"Databases to process: {len(databases_to_process)}\n")
-                logger.info(f"Created session tracking file: {session_tracking_file}")
+                    f.write(f"Total databases found: {len(databases)}\n")
+                    f.write(f"Script version: v1.0.5+ (infinite loop fix)\n")
+                logger.info(f"🔍 INFINITE LOOP DEBUG: Created session tracking file: {session_tracking_file}")
             except Exception as e:
-                logger.warning(f"Could not create session tracking file: {e}")
+                logger.warning(f"🔍 INFINITE LOOP DEBUG: Could not create session tracking file: {e}")
 
             # Process each database with enhanced monitoring
             for idx, (db_path, db_last_modified) in enumerate(databases_to_process, 1):
@@ -3259,14 +3466,21 @@ def main():
             with OperationContext("GENERATE_FINAL_REPORT", 'MAIN', logger):
                 generate_final_report()
 
-                # Clean up session tracking file on successful completion
+                # Update session tracking file to mark completion (DO NOT DELETE - needed for infinite loop prevention)
                 session_tracking_file = "sync_session_completed.flag"
                 try:
                     if os.path.exists(session_tracking_file):
-                        os.remove(session_tracking_file)
-                        logger.info(f"Removed session tracking file: {session_tracking_file}")
+                        # Update the file to show completion status instead of deleting
+                        logger.info(f"🔍 INFINITE LOOP DEBUG: Updating session file to mark completion")
+                        with open(session_tracking_file, 'a') as f:
+                            f.write(f"Session completed: {datetime.now().isoformat()}\n")
+                            f.write(f"Databases processed: {len(databases_to_process)}\n")
+                            f.write(f"Status: COMPLETED_SUCCESS\n")
+                        logger.info(f"🔍 INFINITE LOOP DEBUG: Session file updated (NOT deleted - prevents infinite loop)")
+                    else:
+                        logger.warning(f"🔍 INFINITE LOOP DEBUG: Session file not found for completion update")
                 except Exception as e:
-                    logger.warning(f"Could not remove session tracking file: {e}")
+                    logger.warning(f"🔍 INFINITE LOOP DEBUG: Could not update session tracking file: {e}")
 
                 # Send Telegram completion notification
                 if telegram_enabled:
@@ -3333,11 +3547,11 @@ def main():
                     os.remove(lock_file)
                     logger.info(f"Removed process lock file: {lock_file}")
 
-                # Remove session tracking file
+                # DO NOT remove session tracking file - it prevents infinite loops
                 session_tracking_file = "sync_session_completed.flag"
                 if os.path.exists(session_tracking_file):
-                    os.remove(session_tracking_file)
-                    logger.info(f"Removed session tracking file: {session_tracking_file}")
+                    logger.info(f"🔍 INFINITE LOOP DEBUG: Session file preserved for infinite loop prevention: {session_tracking_file}")
+                    logger.info(f"🔍 INFINITE LOOP DEBUG: File will be automatically cleaned after 1 hour or can be manually deleted")
 
                 # Clean up connection pool
                 if connection_pool:
