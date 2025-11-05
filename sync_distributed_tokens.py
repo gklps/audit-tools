@@ -38,7 +38,7 @@ except ImportError:
     print("Telegram notifications not available - telegram_notifier module not found")
 
 # Configuration
-AZURE_SQL_CONNECTION_STRING = "Server=tcp:rauditser.database.windows.net,1433;Initial Catalog=rauditd;Persist Security Info=False;User ID=rubix;Password={your_password};MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
+AZURE_SQL_CONNECTION_STRING = "DRIVER={ODBC Driver 17 for SQL Server};SERVER=tcp:rauditser.database.windows.net,1433;DATABASE=rauditd;UID=rubix;PWD=Hg&ERwR!8mhMv9mD&Mu;Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
 CONNECTION_CONFIG_FILE = 'azure_sql_connection.txt'
 # Smart IPFS binary detection
 def find_ipfs_binary() -> str:
