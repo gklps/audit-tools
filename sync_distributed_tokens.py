@@ -1825,7 +1825,7 @@ def process_database_incremental(db_path: str, db_last_modified: float, source_i
 
         # Filter by specific token_status values (0,1,2,3,5,9,12,13,14,15,16,17)
         valid_statuses = "(0,1,2,3,5,9,12,13,14,15,16,17)"
-        where_clause = f"WHERE token_status IN {valid_statuses}" if 'token_status' in available_columns else ""
+        where_clause = f"WHERE token_status IN {valid_statuses}" if 'token_status' in existing_columns else ""
 
         query = f"SELECT {', '.join(column_selects)} FROM TokensTable {where_clause}"
         logger.info(f"  📊 SQLite query for {node_name}: {query}")
@@ -2029,7 +2029,7 @@ def process_database(db_path: str, db_last_modified: float, source_ip: str, scri
 
         # Filter by specific token_status values (0,1,2,3,5,9,12,13,14,15,16,17)
         valid_statuses = "(0,1,2,3,5,9,12,13,14,15,16,17)"
-        where_clause = f"WHERE token_status IN {valid_statuses}" if 'token_status' in available_columns else ""
+        where_clause = f"WHERE token_status IN {valid_statuses}" if 'token_status' in existing_columns else ""
 
         query = f"SELECT {', '.join(column_selects)} FROM TokensTable {where_clause}"
         logger.info(f"  SQLite query for {node_name}: {query}")
