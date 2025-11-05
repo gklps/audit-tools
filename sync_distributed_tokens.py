@@ -16,6 +16,8 @@ import requests
 import json
 import pyodbc
 import argparse
+import random
+import math
 # import pandas as pd  # Removed - not used in the script
 from typing import List, Optional, Tuple, Dict, Any
 from multiprocessing import Pool, cpu_count
@@ -37,8 +39,8 @@ except ImportError:
     TELEGRAM_AVAILABLE = False
     print("Telegram notifications not available - telegram_notifier module not found")
 
-# Configuration
-AZURE_SQL_CONNECTION_STRING = "DRIVER={ODBC Driver 17 for SQL Server};SERVER=tcp:rauditser.database.windows.net,1433;DATABASE=rauditd;UID=rubix;PWD=Hg&ERwR!8mhMv9mD&Mu;Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+# Configuration - Optimized for Azure SQL Database stability under load
+AZURE_SQL_CONNECTION_STRING = "DRIVER={ODBC Driver 17 for SQL Server};SERVER=tcp:rauditser.database.windows.net,1433;DATABASE=rauditd;UID=rubix;PWD=Hg&ERwR!8mhMv9mD&Mu;Encrypt=yes;TrustServerCertificate=no;Connection Timeout=120;Command Timeout=300;ConnectionRetryCount=3;ConnectRetryInterval=10;"
 CONNECTION_CONFIG_FILE = 'azure_sql_connection.txt'
 # Smart IPFS binary detection
 def find_ipfs_binary() -> str:
@@ -196,11 +198,12 @@ TELEGRAM_CONFIG_FILE = 'telegram_config.json'
 NUM_DB_WORKERS = max(1, cpu_count() // 2)  # Parallel database processing
 NUM_IPFS_WORKERS = cpu_count() * 2  # Increased for better IPFS throughput
 BATCH_SIZE = 2000  # Larger batches for Azure SQL Database efficiency
-BULK_INSERT_SIZE = 1000   # Reduced for Azure SQL stability - prevents network timeouts
+BULK_INSERT_SIZE = 500    # Further reduced for Azure SQL stability - prevents overwhelming the database
 IPFS_TIMEOUT = 12  # Reduced timeout for faster failover
-CONNECTION_POOL_SIZE = 10  # Connection pool for Azure SQL
-RETRY_ATTEMPTS = 3  # Retry failed operations
+CONNECTION_POOL_SIZE = 3   # Reduced connection pool to prevent Azure SQL throttling
+RETRY_ATTEMPTS = 5  # Increased retry attempts for connection failures
 PROGRESS_REPORT_INTERVAL = 100  # Report progress every N records
+MAX_RETRY_DELAY = 60  # Maximum retry delay in seconds
 
 # Data validation and quality settings
 VALIDATE_TOKEN_FORMAT = True
@@ -806,29 +809,79 @@ class AzureSQLConnectionPool:
         self.pool_lock = threading.Lock()
         self.active_connections = 0
 
+    def is_connection_alive(self, conn) -> bool:
+        """Check if a database connection is still alive"""
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+            cursor.close()
+            return True
+        except Exception as e:
+            logger.debug(f"Connection health check failed: {e}")
+            return False
+
     def get_connection(self):
-        """Get a connection from the pool or create a new one"""
+        """Get a connection from the pool or create a new one with health checks"""
         with self.pool_lock:
-            if self.pool:
-                return self.pool.pop()
-            elif self.active_connections < self.pool_size:
+            # Try to get a healthy connection from the pool
+            while self.pool:
+                conn = self.pool.pop()
+                if self.is_connection_alive(conn):
+                    logger.debug("Retrieved healthy connection from pool")
+                    return conn
+                else:
+                    logger.debug("Discarded dead connection from pool")
+                    try:
+                        conn.close()
+                    except:
+                        pass
+                    self.active_connections -= 1
+
+            # Pool empty or no healthy connections, create new one
+            if self.active_connections < self.pool_size:
                 self.active_connections += 1
-                # Debug: Log the connection string being used
-                logger.debug(f"Creating connection with string: {self.connection_string[:50]}...")
-                return pyodbc.connect(self.connection_string)
+                logger.debug(f"Creating new connection with string: {self.connection_string[:50]}...")
+
+                def create_connection():
+                    return pyodbc.connect(self.connection_string)
+
+                # Use retry logic for connection creation
+                try:
+                    return retry_database_operation(
+                        create_connection,
+                        max_attempts=3,
+                        operation_name="create database connection"
+                    )
+                except Exception as e:
+                    self.active_connections -= 1  # Decrement on failure
+                    raise e
             else:
-                # Pool exhausted, wait and retry
-                time.sleep(0.1)
+                # Pool exhausted, wait and retry with exponential backoff
+                logger.debug("Connection pool exhausted, waiting...")
+                time.sleep(0.5)  # Increased wait time
                 return self.get_connection()
 
     def return_connection(self, conn):
-        """Return a connection to the pool"""
+        """Return a connection to the pool with health check"""
         with self.pool_lock:
-            if len(self.pool) < self.pool_size:
-                self.pool.append(conn)
+            # Only return healthy connections to the pool
+            if self.is_connection_alive(conn):
+                if len(self.pool) < self.pool_size:
+                    self.pool.append(conn)
+                    logger.debug("Returned healthy connection to pool")
+                else:
+                    conn.close()
+                    self.active_connections -= 1
+                    logger.debug("Closed excess connection")
             else:
-                conn.close()
+                # Connection is dead, close it
+                try:
+                    conn.close()
+                except:
+                    pass
                 self.active_connections -= 1
+                logger.debug("Closed dead connection")
 
     def close_all(self):
         """Close all connections in the pool"""
@@ -843,6 +896,76 @@ class AzureSQLConnectionPool:
 
 # Global connection pool
 connection_pool = None
+
+
+def exponential_backoff_delay(attempt: int, base_delay: float = 1.0, max_delay: float = MAX_RETRY_DELAY) -> float:
+    """Calculate exponential backoff delay with jitter"""
+    delay = min(base_delay * (2 ** attempt) + random.uniform(0, 1), max_delay)
+    return delay
+
+
+def is_retryable_error(error: Exception) -> bool:
+    """Check if the database error is retryable"""
+    error_str = str(error).lower()
+    retryable_errors = [
+        'communication link failure',
+        'connection timeout',
+        'connection reset',
+        'connection closed',
+        'server unavailable',
+        'connection broken',
+        'operation timed out',
+        'network error',
+        'tcp provider',
+        'named pipe provider',
+        'connection was forcibly closed',
+        'timeout expired',
+        'connection pool exhausted',
+        'server is busy',
+        'resource limit exceeded'
+    ]
+    return any(retryable_str in error_str for retryable_str in retryable_errors)
+
+
+def retry_database_operation(operation_func, *args, max_attempts: int = RETRY_ATTEMPTS, operation_name: str = "database operation", **kwargs):
+    """
+    Retry database operations with exponential backoff for connection failures
+
+    Args:
+        operation_func: Function to retry
+        *args: Arguments for the function
+        max_attempts: Maximum retry attempts
+        operation_name: Name of the operation for logging
+        **kwargs: Keyword arguments for the function
+
+    Returns:
+        Result of the operation
+
+    Raises:
+        Exception: If all retry attempts fail
+    """
+    last_exception = None
+
+    for attempt in range(max_attempts):
+        try:
+            return operation_func(*args, **kwargs)
+        except Exception as e:
+            last_exception = e
+
+            if not is_retryable_error(e):
+                # Non-retryable error, fail immediately
+                logger.error(f"Non-retryable error in {operation_name}: {e}")
+                raise e
+
+            if attempt < max_attempts - 1:  # Don't delay on last attempt
+                delay = exponential_backoff_delay(attempt)
+                logger.warning(f"Retry {attempt + 1}/{max_attempts} for {operation_name} in {delay:.1f}s - Error: {e}")
+                time.sleep(delay)
+            else:
+                logger.error(f"All {max_attempts} attempts failed for {operation_name} - Final error: {e}")
+
+    # All attempts failed
+    raise last_exception
 
 
 def get_azure_sql_connection_string() -> str:
@@ -2632,25 +2755,42 @@ def bulk_insert_essential_records(records: List[TokenRecord]) -> Tuple[int, int]
                             synced_at = GETUTCDATE();
                 """
 
-                # Execute MERGE for each record in batch
+                # Execute MERGE for each record in batch with retry logic
                 for record_data in batch_data:
                     try:
-                        cursor.execute(merge_query, record_data)
+                        def execute_merge():
+                            cursor.execute(merge_query, record_data)
+
+                        # Use retry logic for database operations
+                        retry_database_operation(
+                            execute_merge,
+                            max_attempts=RETRY_ATTEMPTS,
+                            operation_name=f"merge essential record (token_id: {record_data[3]})"
+                        )
                         success_count += 1
                     except Exception as record_error:
                         error_count += 1
                         audit_logger.log_with_context(
                             sql_logger, logging.WARNING,
-                            f"Failed to merge essential record: {record_error}",
+                            f"Failed to merge essential record after {RETRY_ATTEMPTS} attempts: {record_error}",
                             component='SQL', operation='ESSENTIAL_MERGE',
                             extra_data={
                                 'error': str(record_error),
+                                'error_type': type(record_error).__name__,
+                                'retryable': is_retryable_error(record_error),
                                 'record_data': record_data[:4]  # source_ip, node_name, did, token_id
                             }
                         )
 
-                # Commit batch
-                conn.commit()
+                # Commit batch with retry logic
+                def commit_batch():
+                    conn.commit()
+
+                retry_database_operation(
+                    commit_batch,
+                    max_attempts=RETRY_ATTEMPTS,
+                    operation_name=f"commit essential batch ({len(batch)} records)"
+                )
                 total_processed += len(batch)
                 batch_time = time.time() - batch_start
 
@@ -2740,46 +2880,68 @@ def update_processed_database(db_path: str, db_last_modified: float, record_coun
         cursor = conn.cursor()
         db_modified_dt = datetime.fromtimestamp(db_last_modified)
 
-        # Use MERGE for upsert operation in Azure SQL Database
+        # Use MERGE for upsert operation in Azure SQL Database with retry logic
         logger.info(f"🔍 INFINITE LOOP DEBUG: Executing MERGE statement for {db_path}")
-        cursor.execute("""
-            MERGE [dbo].[ProcessedDatabases] AS target
-            USING (VALUES (?, ?, GETUTCDATE(), ?, ?, ?, ?, ?)) AS source
-                ([db_path], [last_modified], [last_processed], [record_count],
-                 [ipfs_success_count], [ipfs_fail_count], [validation_error_count], [processing_duration_seconds])
-            ON target.[db_path] = source.[db_path]
-            WHEN MATCHED THEN
-                UPDATE SET
-                    [last_modified] = source.[last_modified],
-                    [last_processed] = source.[last_processed],
-                    [record_count] = source.[record_count],
-                    [ipfs_success_count] = source.[ipfs_success_count],
-                    [ipfs_fail_count] = source.[ipfs_fail_count],
-                    [validation_error_count] = source.[validation_error_count],
-                    [processing_duration_seconds] = source.[processing_duration_seconds]
-            WHEN NOT MATCHED THEN
-                INSERT ([db_path], [last_modified], [last_processed], [record_count],
-                       [ipfs_success_count], [ipfs_fail_count], [validation_error_count], [processing_duration_seconds])
-                VALUES (source.[db_path], source.[last_modified], source.[last_processed], source.[record_count],
-                       source.[ipfs_success_count], source.[ipfs_fail_count], source.[validation_error_count], source.[processing_duration_seconds]);
-        """, (db_path, db_modified_dt, record_count, ipfs_success, ipfs_fail, validation_errors, processing_duration))
+
+        def execute_processed_db_merge():
+            cursor.execute("""
+                MERGE [dbo].[ProcessedDatabases] AS target
+                USING (VALUES (?, ?, GETUTCDATE(), ?, ?, ?, ?, ?)) AS source
+                    ([db_path], [last_modified], [last_processed], [record_count],
+                     [ipfs_success_count], [ipfs_fail_count], [validation_error_count], [processing_duration_seconds])
+                ON target.[db_path] = source.[db_path]
+                WHEN MATCHED THEN
+                    UPDATE SET
+                        [last_modified] = source.[last_modified],
+                        [last_processed] = source.[last_processed],
+                        [record_count] = source.[record_count],
+                        [ipfs_success_count] = source.[ipfs_success_count],
+                        [ipfs_fail_count] = source.[ipfs_fail_count],
+                        [validation_error_count] = source.[validation_error_count],
+                        [processing_duration_seconds] = source.[processing_duration_seconds]
+                WHEN NOT MATCHED THEN
+                    INSERT ([db_path], [last_modified], [last_processed], [record_count],
+                           [ipfs_success_count], [ipfs_fail_count], [validation_error_count], [processing_duration_seconds])
+                    VALUES (source.[db_path], source.[last_modified], source.[last_processed], source.[record_count],
+                           source.[ipfs_success_count], source.[ipfs_fail_count], source.[validation_error_count], source.[processing_duration_seconds]);
+            """, (db_path, db_modified_dt, record_count, ipfs_success, ipfs_fail, validation_errors, processing_duration))
+
+        retry_database_operation(
+            execute_processed_db_merge,
+            max_attempts=RETRY_ATTEMPTS,
+            operation_name=f"update processed database metadata for {db_path}"
+        )
 
         # Check how many rows were affected
         rows_affected = cursor.rowcount
         logger.info(f"🔍 INFINITE LOOP DEBUG: MERGE statement affected {rows_affected} rows")
 
-        conn.commit()
+        def commit_processed_db():
+            conn.commit()
+
+        retry_database_operation(
+            commit_processed_db,
+            max_attempts=RETRY_ATTEMPTS,
+            operation_name=f"commit processed database metadata for {db_path}"
+        )
         logger.info(f"🔍 INFINITE LOOP DEBUG: Transaction committed successfully for {db_path}")
 
         # CRITICAL: Verify the record was actually saved by reading it back
         logger.info(f"🔍 INFINITE LOOP DEBUG: Verifying record was saved - reading back from database")
-        cursor.execute("""
-            SELECT [db_path], DATEDIFF(SECOND, '1970-01-01', [last_modified]), [record_count]
-            FROM [dbo].[ProcessedDatabases]
-            WHERE [db_path] = ?
-        """, (db_path,))
 
-        verification_row = cursor.fetchone()
+        def verify_processed_db():
+            cursor.execute("""
+                SELECT [db_path], DATEDIFF(SECOND, '1970-01-01', [last_modified]), [record_count]
+                FROM [dbo].[ProcessedDatabases]
+                WHERE [db_path] = ?
+            """, (db_path,))
+            return cursor.fetchone()
+
+        verification_row = retry_database_operation(
+            verify_processed_db,
+            max_attempts=RETRY_ATTEMPTS,
+            operation_name=f"verify processed database record for {db_path}"
+        )
         if verification_row:
             saved_path, saved_timestamp, saved_count = verification_row
             logger.info(f"🔍 INFINITE LOOP DEBUG: *** VERIFICATION SUCCESS *** Record found for {saved_path}")
