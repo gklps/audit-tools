@@ -79,23 +79,32 @@ class RubixLauncher:
 
     def check_azure_sql_config(self) -> bool:
         """Check if Azure SQL configuration exists and is valid"""
-        if not self.azure_config_file.exists():
-            return False
+        config_content = ""
 
-        try:
-            with open(self.azure_config_file, 'r') as f:
-                config_content = f.read().strip()
+        # Try to read from config file first
+        if self.azure_config_file.exists():
+            try:
+                with open(self.azure_config_file, 'r') as f:
+                    config_content = f.read().strip()
+            except Exception:
+                config_content = ""
 
-            # Check if it's still using template placeholder
-            if "{your_password}" in config_content:
+        # If no config file or empty, fall back to hardcoded connection string
+        if not config_content:
+            try:
+                from sync_distributed_tokens import AZURE_SQL_CONNECTION_STRING
+                config_content = AZURE_SQL_CONNECTION_STRING
+            except ImportError:
                 return False
 
-            # Basic validation - should contain required components
-            required_parts = ["Server=", "Database=", "UID=", "PWD="]
-            return all(part in config_content for part in required_parts)
-
-        except Exception:
+        # Check if it's still using template placeholder
+        if "{your_password}" in config_content:
             return False
+
+        # Basic validation - should contain required components (case-insensitive)
+        required_parts = ["SERVER=", "DATABASE=", "UID=", "PWD="]
+        config_upper = config_content.upper()
+        return all(part in config_upper for part in required_parts)
 
     def check_telegram_config(self) -> bool:
         """Check if Telegram configuration exists and is valid"""
