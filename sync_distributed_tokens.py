@@ -566,7 +566,9 @@ def log_ipfs_operation(token_id: str, operation: str, ipfs_path: str = None,
     if error:
         extra_data['error'] = str(error)
 
-    level = logging.INFO if success else logging.WARNING
+    # Only log individual failures at debug level to reduce noise
+    # Batch summaries will be logged at info level instead
+    level = logging.DEBUG if not success else logging.DEBUG
     message = f"IPFS {operation} for token {token_id}: {'SUCCESS' if success else 'FAILED'}"
 
     audit_logger.log_with_context(
@@ -613,6 +615,49 @@ def log_performance_metrics(operation: str, metrics: Dict[str, Any]):
         f"Performance metrics for {operation}",
         component='PERFORMANCE', operation=operation,
         extra_data=metrics
+    )
+
+def log_ipfs_batch_summary(batch_name: str, total_tokens: int, successful: int, failed: int,
+                          lock_conflicts: int = 0, duration_seconds: float = None):
+    """Log IPFS batch processing summary with statistics"""
+    success_rate = (successful / total_tokens * 100) if total_tokens > 0 else 0
+
+    # Create a concise status message
+    status_parts = []
+    if successful > 0:
+        status_parts.append(f"{successful} successful")
+    if failed > 0:
+        status_parts.append(f"{failed} failed")
+    if lock_conflicts > 0:
+        status_parts.append(f"{lock_conflicts} lock conflicts")
+
+    status_summary = ", ".join(status_parts)
+
+    # Use ASCII progress bar for visual feedback (Windows-compatible)
+    progress_bar = "=" * int(success_rate // 10) + "-" * (10 - int(success_rate // 10))
+
+    message = f"IPFS {batch_name}: [{progress_bar}] {successful}/{total_tokens} ({success_rate:.1f}%) - {status_summary}"
+
+    if duration_seconds:
+        tokens_per_sec = total_tokens / duration_seconds
+        message += f" - {tokens_per_sec:.1f} tokens/sec"
+
+    extra_data = {
+        'batch_name': batch_name,
+        'total_tokens': total_tokens,
+        'successful': successful,
+        'failed': failed,
+        'lock_conflicts': lock_conflicts,
+        'success_rate_percent': round(success_rate, 2),
+        'duration_seconds': duration_seconds,
+        'tokens_per_second': round(total_tokens / duration_seconds, 2) if duration_seconds else None
+    }
+
+    # Use INFO level for batch summaries (will be visible)
+    audit_logger.log_with_context(
+        logger, logging.INFO, message,
+        component='IPFS', operation='BATCH_SUMMARY',
+        extra_data=extra_data
     )
 
 @dataclass
@@ -1227,7 +1272,7 @@ def fetch_ipfs_data(token_id: str, ipfs_path: str, script_dir: str, ipfs_binary:
                                 break
                         else:
                             # Last attempt failed, return the lock error
-                            logger.warning(f"IPFS lock conflict persists for {token_id} after {max_lock_retries} attempts")
+                            logger.debug(f"IPFS lock conflict persists for {token_id} after {max_lock_retries} attempts")
                             break
                     else:
                         # No lock error, break out of retry loop
@@ -1871,23 +1916,33 @@ def process_database_incremental(db_path: str, db_last_modified: float, source_i
                 ]
 
                 # Process IPFS for this batch in parallel
-                logger.info(f"    🔄 Fetching IPFS data for {len(batch_tokens)} tokens...")
+                logger.info(f"    [FETCH] Processing IPFS data for {len(batch_tokens)} tokens...")
+
+                batch_start_time = time.time()
                 with Pool(processes=NUM_IPFS_WORKERS) as pool:
                     batch_records = pool.map(process_token_ipfs, args_list)
+                batch_duration = time.time() - batch_start_time
 
                 # Count batch IPFS successes and failures
                 batch_ipfs_success = sum(1 for r in batch_records if r.ipfs_fetched)
                 batch_ipfs_fail = len(batch_records) - batch_ipfs_success
 
-                logger.info(f"    📈 IPFS results: {batch_ipfs_success} succeeded, {batch_ipfs_fail} failed")
+                # Log batch summary with progress bar
+                log_ipfs_batch_summary(
+                    f"Batch {batch_idx + 1}/{total_batches}",
+                    len(batch_tokens),
+                    batch_ipfs_success,
+                    batch_ipfs_fail,
+                    duration_seconds=batch_duration
+                )
 
                 # Immediately insert this batch to database
                 if batch_records:
-                    logger.info(f"    💾 Inserting batch {batch_idx + 1} to database...")
+                    logger.info(f"    [DB] Inserting batch {batch_idx + 1} to database...")
                     success_count, error_count = bulk_insert_records(batch_records)
 
                     if error_count == 0:
-                        logger.info(f"    ✅ Batch {batch_idx + 1} inserted successfully: {success_count} records")
+                        logger.info(f"    [OK] Batch {batch_idx + 1} inserted successfully: {success_count} records")
                         successful_batches += 1
                         total_processed += len(batch_tokens)
                         total_ipfs_success += batch_ipfs_success
@@ -2052,19 +2107,29 @@ def process_database(db_path: str, db_last_modified: float, source_ip: str, scri
         ]
 
         # Process tokens in parallel (IPFS calls)
-        logger.info(f"  Fetching IPFS data for {len(token_rows)} tokens using {NUM_IPFS_WORKERS} workers...")
+        logger.info(f"  [FETCH] Processing IPFS data for {len(token_rows)} tokens using {NUM_IPFS_WORKERS} workers...")
 
+        batch_start_time = time.time()
         with Pool(processes=NUM_IPFS_WORKERS) as pool:
             records = pool.map(process_token_ipfs, args_list)
+        batch_duration = time.time() - batch_start_time
 
         # Count IPFS successes and failures
         ipfs_success = sum(1 for r in records if r.ipfs_fetched)
         ipfs_fail = len(records) - ipfs_success
         validation_errors = sum(1 for r in records if r.validation_errors)
 
-        logger.info(f"  IPFS fetch: {ipfs_success} succeeded, {ipfs_fail} failed")
+        # Log batch summary with progress bar
+        log_ipfs_batch_summary(
+            f"{node_name} Essential",
+            len(token_rows),
+            ipfs_success,
+            ipfs_fail,
+            duration_seconds=batch_duration
+        )
+
         if validation_errors > 0:
-            logger.warning(f"  Validation errors: {validation_errors}")
+            logger.warning(f"  [VALIDATION] {validation_errors} validation errors detected")
 
         return records
 
