@@ -1417,10 +1417,14 @@ def ensure_essential_metadata(db_path: str, source_ip: str, force_update: bool =
         else:
             essential_selects.append("'c not found' as token_id")
 
-        query = f"SELECT {', '.join(essential_selects)} FROM TokensTable"
+        # Filter by specific token_status values (0,1,2,3,5,9,12,13,14,15,16,17)
+        valid_statuses = "(0,1,2,3,5,9,12,13,14,15,16,17)"
+        where_clause = f"WHERE token_status IN {valid_statuses}" if 'token_status' in existing_columns else ""
+
+        query = f"SELECT {', '.join(essential_selects)} FROM TokensTable {where_clause}"
         logger.info(f"Essential metadata query: {query}")
 
-        # Read essential data
+        # Read filtered essential data
         cursor.execute(query)
         rows = cursor.fetchall()
         conn.close()
@@ -1819,10 +1823,14 @@ def process_database_incremental(db_path: str, db_last_modified: float, source_i
             else:
                 column_selects.append(f"'c not found' as {col}")
 
-        query = f"SELECT {', '.join(column_selects)} FROM TokensTable"
+        # Filter by specific token_status values (0,1,2,3,5,9,12,13,14,15,16,17)
+        valid_statuses = "(0,1,2,3,5,9,12,13,14,15,16,17)"
+        where_clause = f"WHERE token_status IN {valid_statuses}" if 'token_status' in available_columns else ""
+
+        query = f"SELECT {', '.join(column_selects)} FROM TokensTable {where_clause}"
         logger.info(f"  📊 SQLite query for {node_name}: {query}")
 
-        # Read all tokens with dynamic column handling
+        # Read filtered tokens with dynamic column handling
         cursor.execute(query)
         token_rows = cursor.fetchall()
         conn.close()
@@ -2019,10 +2027,14 @@ def process_database(db_path: str, db_last_modified: float, source_ip: str, scri
             else:
                 column_selects.append(f"'c not found' as {col}")
 
-        query = f"SELECT {', '.join(column_selects)} FROM TokensTable"
+        # Filter by specific token_status values (0,1,2,3,5,9,12,13,14,15,16,17)
+        valid_statuses = "(0,1,2,3,5,9,12,13,14,15,16,17)"
+        where_clause = f"WHERE token_status IN {valid_statuses}" if 'token_status' in available_columns else ""
+
+        query = f"SELECT {', '.join(column_selects)} FROM TokensTable {where_clause}"
         logger.info(f"  SQLite query for {node_name}: {query}")
 
-        # Read all tokens with dynamic column handling
+        # Read filtered tokens with dynamic column handling
         cursor.execute(query)
 
         token_rows = cursor.fetchall()
